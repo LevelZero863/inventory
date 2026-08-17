@@ -1,0 +1,41 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+import db
+import services
+
+
+class InventoryServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        db.DB_PATH = Path(self.tmp.name) / "test.db"
+        db.DATA_DIR = Path(self.tmp.name)
+        db.init_db()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_inbound_changes_stock(self):
+        p = db.get_conn().execute("SELECT id FROM products WHERE code='P001'").fetchone()[0]
+        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [{"product_id": p, "quantity": 100, "price": 10}], True)
+        self.assertEqual(services.stock(p, "一号仓"), 100)
+
+    def test_outbound_cannot_exceed_stock(self):
+        p = db.get_conn().execute("SELECT id FROM products WHERE code='P001'").fetchone()[0]
+        with self.assertRaises(ValueError):
+            services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [{"product_id": p, "quantity": 1, "price": 10}], True)
+
+    def test_partial_settlement(self):
+        p = db.get_conn().execute("SELECT id FROM products WHERE code='P001'").fetchone()[0]
+        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [{"product_id": p, "quantity": 100, "price": 10}], True)
+        services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [{"product_id": p, "quantity": 10, "price": 20}], True)
+        oid = db.get_conn().execute("SELECT id FROM outbound_orders ORDER BY id DESC LIMIT 1").fetchone()[0]
+        services.settle(1, "2026-08-17", "银行转账", "测试", "", {oid: 100})
+        row = db.get_conn().execute("SELECT settled_amount,total_amount FROM outbound_orders WHERE id=?", (oid,)).fetchone()
+        self.assertEqual(row[0], 100)
+        self.assertEqual(row[1], 200)
+
+
+if __name__ == "__main__":
+    unittest.main()
