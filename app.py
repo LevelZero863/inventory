@@ -5,6 +5,13 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
+from auth import (
+    INITIAL_ADMIN_PASSWORD,
+    INITIAL_ADMIN_USERNAME,
+    authenticate,
+    change_password,
+    ensure_initial_admin,
+)
 from db import DB_PATH, backup_database, init_db, integrity_check
 from services import (
     add_customer,
@@ -25,6 +32,58 @@ from services import (
 
 st.set_page_config(page_title="库存管理系统", page_icon="📦", layout="wide")
 init_db()
+initial_admin_created = ensure_initial_admin()
+
+
+def render_login():
+    st.title("🔐 库存管理系统登录")
+    st.caption("请输入账号和密码后进入系统。")
+    with st.form("login_form"):
+        username = st.text_input("账号")
+        password = st.text_input("密码", type="password")
+        submitted = st.form_submit_button("登录", type="primary", width="stretch")
+    if submitted:
+        user = authenticate(username, password)
+        if user:
+            st.session_state["auth_user"] = user
+            st.rerun()
+        else:
+            st.error("账号或密码错误")
+    if initial_admin_created:
+        st.info(
+            f"首次登录账号：{INITIAL_ADMIN_USERNAME}，初始密码：{INITIAL_ADMIN_PASSWORD}。"
+            "登录后必须立即修改密码。"
+        )
+
+
+def render_forced_password_change(user):
+    st.title("🔑 首次登录：修改密码")
+    st.warning("为保障数据安全，请先设置新的登录密码。")
+    with st.form("forced_password_change"):
+        new_password = st.text_input("新密码（至少 8 位）", type="password")
+        confirm_password = st.text_input("确认新密码", type="password")
+        submitted = st.form_submit_button("保存新密码", type="primary", width="stretch")
+    if submitted:
+        if new_password != confirm_password:
+            st.error("两次输入的密码不一致")
+        else:
+            try:
+                change_password(int(user["id"]), new_password)
+                user["must_change_password"] = False
+                st.session_state["auth_user"] = user
+                st.success("密码修改成功")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+
+if "auth_user" not in st.session_state:
+    render_login()
+    st.stop()
+
+if st.session_state["auth_user"].get("must_change_password"):
+    render_forced_password_change(st.session_state["auth_user"])
+    st.stop()
 
 INVENTORY_COLUMNS = {
     "product_code": "产品编码",
@@ -130,6 +189,10 @@ def outbound_dialog():
     remark = st.text_input("备注", key="outbound_remark")
     st.markdown("#### 出库明细")
     edited = product_item_editor(products, product_map, "outbound_items_editor")
+    quantities = pd.to_numeric(edited.get("数量"), errors="coerce").fillna(0)
+    prices = pd.to_numeric(edited.get("单价"), errors="coerce").fillna(0)
+    total_amount = float((quantities * prices).sum())
+    st.metric("出库单总金额", f"¥{total_amount:,.2f}")
     if st.button("提交并生效", type="primary", key="submit_outbound"):
         try:
             no = create_outbound(
@@ -204,9 +267,15 @@ def settlement_dialog():
 
 
 st.title("📦 库存管理系统")
-st.caption("AI 安全迭代版 V1.1 · Streamlit + SQLite + Migration")
+st.caption("AI 安全迭代版 V1.2 · Streamlit + SQLite + Migration")
 if message := st.session_state.pop("flash", None):
     st.success(message)
+
+user = st.session_state["auth_user"]
+st.sidebar.write(f"👤 {user['display_name'] or user['username']}")
+if st.sidebar.button("退出登录", width="stretch"):
+    st.session_state.pop("auth_user", None)
+    st.rerun()
 
 with st.sidebar.expander("🛡️ 数据安全", expanded=False):
     st.caption(f"数据库：{DB_PATH.name}")

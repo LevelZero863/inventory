@@ -13,7 +13,7 @@ class SafetyTests(unittest.TestCase):
     def test_migration_and_integrity(self):
         self.assertEqual(db.integrity_check(), "ok")
         conn=db.get_conn()
-        self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0],1)
+        self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0],2)
         conn.close()
     def test_backup_preserves_data(self):
         conn=db.get_conn(); conn.execute("INSERT INTO products(code,name) VALUES('X001','测试产品')"); conn.commit(); conn.close()

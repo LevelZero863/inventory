@@ -59,6 +59,27 @@ class InventoryServiceTests(unittest.TestCase):
         self.assertEqual(summary[0]["order_count"], 2)
         self.assertEqual(summary[0]["outstanding"], 300)
 
+    def test_outbound_total_is_sum_of_all_items(self):
+        conn = db.get_conn()
+        product_ids = [row[0] for row in conn.execute("SELECT id FROM products ORDER BY id LIMIT 2")]
+        conn.close()
+        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [
+            {"product_id": product_ids[0], "quantity": 100, "price": 10},
+            {"product_id": product_ids[1], "quantity": 100, "price": 20},
+        ])
+        services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [
+            {"product_id": product_ids[0], "quantity": 2, "price": 12.5},
+            {"product_id": product_ids[1], "quantity": 3, "price": 20},
+        ])
+        conn = db.get_conn()
+        order = conn.execute("SELECT total_amount FROM outbound_orders ORDER BY id DESC LIMIT 1").fetchone()
+        item_total = conn.execute("""SELECT SUM(i.amount) FROM outbound_items i
+                                     JOIN outbound_orders o ON o.id=i.order_id
+                                     WHERE o.id=(SELECT MAX(id) FROM outbound_orders)""").fetchone()[0]
+        conn.close()
+        self.assertEqual(order["total_amount"], 85)
+        self.assertEqual(item_total, 85)
+
 
 if __name__ == "__main__":
     unittest.main()
