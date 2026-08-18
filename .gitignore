@@ -1,8 +1,13 @@
 .venv/
 __pycache__/
-*.py[cod]
-.pytest_cache/
+*.pyc
 .DS_Store
 .streamlit/secrets.toml
+
 data/*.db
+data/*.db-shm
+data/*.db-wal
+backups/*.db
+data/*.sqlite
 data/*.sqlite3
+backups/

@@ -4,7 +4,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from db import init_db
+from db import init_db, backup_database, integrity_check, DB_PATH
 from services import (
     add_customer, add_product, create_inbound, create_outbound,
     dashboard, inbound_list, inventory_rows, list_customers, list_products,
@@ -15,7 +15,17 @@ st.set_page_config(page_title="库存管理系统", page_icon="📦", layout="wi
 init_db()
 
 st.title("📦 库存管理系统")
-st.caption("Streamlit + SQLite Demo")
+st.caption("AI 安全迭代版 V1.0 · Streamlit + SQLite + Migration")
+
+with st.sidebar.expander("🛡️ 数据安全", expanded=False):
+    st.caption(f"数据库：{DB_PATH.name}")
+    if st.button("立即备份数据库"):
+        try:
+            p = backup_database(label="manual")
+            st.success(f"备份完成：{p.name}")
+        except Exception as e:
+            st.error(str(e))
+    st.write("完整性检查：", integrity_check())
 
 menu = st.sidebar.radio("功能菜单", ["首页", "基础资料", "入库管理", "出库管理", "结算管理", "应收账款", "库存查询"])
 

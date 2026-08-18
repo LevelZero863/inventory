@@ -9,9 +9,9 @@ from db import get_conn
 def next_no(prefix: str) -> str:
     today = date.today().strftime("%Y%m%d")
     conn = get_conn()
-    row = conn.execute("SELECT COUNT(*) FROM operation_logs WHERE source_no LIKE ?", (f"{prefix}{today}%",)).fetchone()
+    row = conn.execute("SELECT MAX(CAST(substr(source_no, 11) AS INTEGER)) FROM operation_logs WHERE source_no LIKE ?", (f"{prefix}{today}%",)).fetchone()
     conn.close()
-    return f"{prefix}{today}{row[0] + 1:03d}"
+    return f"{prefix}{today}{int(row[0] or 0) + 1:03d}"
 
 
 def list_products():

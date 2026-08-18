@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")"
+if [ ! -d .venv ]; then python3 -m venv .venv; fi
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python scripts/check_db.py
+.venv/bin/python -m streamlit run app.py --server.headless=false
