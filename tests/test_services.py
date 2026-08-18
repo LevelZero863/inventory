@@ -18,23 +18,46 @@ class InventoryServiceTests(unittest.TestCase):
 
     def test_inbound_changes_stock(self):
         p = db.get_conn().execute("SELECT id FROM products WHERE code='P001'").fetchone()[0]
-        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [{"product_id": p, "quantity": 100, "price": 10}], True)
+        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [{"product_id": p, "quantity": 100, "price": 10}])
         self.assertEqual(services.stock(p, "一号仓"), 100)
+        status = db.get_conn().execute("SELECT status FROM inbound_orders ORDER BY id DESC LIMIT 1").fetchone()[0]
+        self.assertEqual(status, "已生效")
+
+    def test_inbound_supports_multiple_items(self):
+        conn = db.get_conn()
+        product_ids = [row[0] for row in conn.execute("SELECT id FROM products ORDER BY id LIMIT 2")]
+        conn.close()
+        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [
+            {"product_id": product_ids[0], "quantity": 10, "price": 10},
+            {"product_id": product_ids[1], "quantity": 20, "price": 20},
+        ])
+        self.assertEqual(services.stock(product_ids[0], "一号仓"), 10)
+        self.assertEqual(services.stock(product_ids[1], "一号仓"), 20)
 
     def test_outbound_cannot_exceed_stock(self):
         p = db.get_conn().execute("SELECT id FROM products WHERE code='P001'").fetchone()[0]
         with self.assertRaises(ValueError):
-            services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [{"product_id": p, "quantity": 1, "price": 10}], True)
+            services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [{"product_id": p, "quantity": 1, "price": 10}])
 
     def test_partial_settlement(self):
         p = db.get_conn().execute("SELECT id FROM products WHERE code='P001'").fetchone()[0]
-        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [{"product_id": p, "quantity": 100, "price": 10}], True)
-        services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [{"product_id": p, "quantity": 10, "price": 20}], True)
+        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [{"product_id": p, "quantity": 100, "price": 10}])
+        services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [{"product_id": p, "quantity": 10, "price": 20}])
         oid = db.get_conn().execute("SELECT id FROM outbound_orders ORDER BY id DESC LIMIT 1").fetchone()[0]
         services.settle(1, "2026-08-17", "银行转账", "测试", "", {oid: 100})
         row = db.get_conn().execute("SELECT settled_amount,total_amount FROM outbound_orders WHERE id=?", (oid,)).fetchone()
         self.assertEqual(row[0], 100)
         self.assertEqual(row[1], 200)
+
+    def test_receivables_are_grouped_by_customer(self):
+        p = db.get_conn().execute("SELECT id FROM products WHERE code='P001'").fetchone()[0]
+        services.create_inbound("2026-08-17", "供应商A", "一号仓", "测试", "", [{"product_id": p, "quantity": 100, "price": 10}])
+        services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [{"product_id": p, "quantity": 10, "price": 20}])
+        services.create_outbound("2026-08-17", 1, "一号仓", "测试", "", [{"product_id": p, "quantity": 5, "price": 20}])
+        summary = services.receivable_summary()
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["order_count"], 2)
+        self.assertEqual(summary[0]["outstanding"], 300)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from collections import defaultdict
 from typing import Iterable
 
 from db import get_conn
@@ -49,7 +50,12 @@ def stock(product_id: int, warehouse: str) -> float:
     conn = get_conn(); row = conn.execute("SELECT COALESCE(SUM(qty),0) FROM inventory_txns WHERE product_id=? AND warehouse=?", (product_id, warehouse)).fetchone(); conn.close(); return float(row[0])
 
 
-def create_inbound(order_date, supplier, warehouse, operator, remark, items: Iterable[dict], confirm=False):
+def create_inbound(order_date, supplier, warehouse, operator, remark, items: Iterable[dict], confirm=None):
+    """Create an inbound order and apply it immediately.
+
+    ``confirm`` is retained only for compatibility with V1.0.1 callers. New
+    orders no longer have a draft state.
+    """
     items = list(items)
     if not items: raise ValueError("至少需要一条入库明细")
     if any(i["quantity"] <= 0 for i in items): raise ValueError("入库数量必须大于0")
@@ -59,14 +65,13 @@ def create_inbound(order_date, supplier, warehouse, operator, remark, items: Ite
     conn = get_conn()
     try:
         conn.execute("BEGIN")
-        cur = conn.execute("INSERT INTO inbound_orders(order_no,order_date,supplier,warehouse,operator,remark,status,total_amount) VALUES(?,?,?,?,?,?,?,?)", (no,order_date,supplier,warehouse,operator,remark,"已确认" if confirm else "草稿",total))
+        cur = conn.execute("INSERT INTO inbound_orders(order_no,order_date,supplier,warehouse,operator,remark,status,total_amount) VALUES(?,?,?,?,?,?,?,?)", (no,order_date,supplier,warehouse,operator,remark,"已生效",total))
         oid = cur.lastrowid
         for i in items:
             amount=i["quantity"]*i["price"]
             conn.execute("INSERT INTO inbound_items(order_id,product_id,quantity,price,amount) VALUES(?,?,?,?,?)", (oid,i["product_id"],i["quantity"],i["price"],amount))
-            if confirm:
-                conn.execute("INSERT INTO inventory_txns(txn_date,warehouse,product_id,qty,txn_type,source_no) VALUES(?,?,?,?,?,?)", (order_date,warehouse,i["product_id"],i["quantity"],"入库",no))
-        conn.execute("INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)", ("确认入库" if confirm else "保存入库草稿",no,operator,""))
+            conn.execute("INSERT INTO inventory_txns(txn_date,warehouse,product_id,qty,txn_type,source_no) VALUES(?,?,?,?,?,?)", (order_date,warehouse,i["product_id"],i["quantity"],"入库",no))
+        conn.execute("INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)", ("入库生效",no,operator,""))
         conn.commit()
     except Exception:
         conn.rollback(); raise
@@ -74,27 +79,33 @@ def create_inbound(order_date, supplier, warehouse, operator, remark, items: Ite
     return no
 
 
-def create_outbound(order_date, customer_id, warehouse, operator, remark, items: Iterable[dict], confirm=False):
+def create_outbound(order_date, customer_id, warehouse, operator, remark, items: Iterable[dict], confirm=None):
+    """Create an outbound order and apply it immediately.
+
+    ``confirm`` is retained only for compatibility with V1.0.1 callers. New
+    orders no longer have a draft state.
+    """
     items = list(items)
     if not items: raise ValueError("至少需要一条出库明细")
     if any(i["quantity"] <= 0 for i in items): raise ValueError("出库数量必须大于0")
-    if confirm:
-        for i in items:
-            if stock(i["product_id"], warehouse) < i["quantity"]:
-                raise ValueError(f"产品ID {i['product_id']} 当前库存不足")
+    required = defaultdict(float)
+    for i in items:
+        required[int(i["product_id"])] += float(i["quantity"])
+    for product_id, quantity in required.items():
+        if stock(product_id, warehouse) < quantity:
+            raise ValueError(f"产品ID {product_id} 当前库存不足")
     total=sum(i["quantity"]*i["price"] for i in items)
     no=next_no("CK")
     conn=get_conn()
     try:
         conn.execute("BEGIN")
-        cur=conn.execute("INSERT INTO outbound_orders(order_no,order_date,customer_id,warehouse,operator,remark,status,total_amount) VALUES(?,?,?,?,?,?,?,?)", (no,order_date,customer_id,warehouse,operator,remark,"已确认" if confirm else "草稿",total))
+        cur=conn.execute("INSERT INTO outbound_orders(order_no,order_date,customer_id,warehouse,operator,remark,status,total_amount) VALUES(?,?,?,?,?,?,?,?)", (no,order_date,customer_id,warehouse,operator,remark,"已生效",total))
         oid=cur.lastrowid
         for i in items:
             amount=i["quantity"]*i["price"]
             conn.execute("INSERT INTO outbound_items(order_id,product_id,quantity,price,amount) VALUES(?,?,?,?,?)", (oid,i["product_id"],i["quantity"],i["price"],amount))
-            if confirm:
-                conn.execute("INSERT INTO inventory_txns(txn_date,warehouse,product_id,qty,txn_type,source_no) VALUES(?,?,?,?,?,?)", (order_date,warehouse,i["product_id"],-i["quantity"],"出库",no))
-        conn.execute("INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)", ("确认出库" if confirm else "保存出库草稿",no,operator,""))
+            conn.execute("INSERT INTO inventory_txns(txn_date,warehouse,product_id,qty,txn_type,source_no) VALUES(?,?,?,?,?,?)", (order_date,warehouse,i["product_id"],-i["quantity"],"出库",no))
+        conn.execute("INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)", ("出库生效",no,operator,""))
         conn.commit()
     except Exception:
         conn.rollback(); raise
@@ -108,11 +119,31 @@ def open_receivables(customer_id=None):
            o.total_amount-o.settled_amount outstanding,
            CASE WHEN o.settled_amount<=0 THEN '未结算' WHEN o.settled_amount<o.total_amount THEN '部分结算' ELSE '已结算' END settlement_status
            FROM outbound_orders o JOIN customers c ON c.id=o.customer_id
-           WHERE o.status='已确认' AND o.total_amount-o.settled_amount>0"""
+           WHERE o.status IN ('已确认','已生效') AND o.total_amount-o.settled_amount>0"""
     params=[]
     if customer_id is not None: sql += " AND o.customer_id=?"; params.append(customer_id)
     sql += " ORDER BY o.order_date,o.id"
     rows=conn.execute(sql,params).fetchall(); conn.close(); return rows
+
+
+def receivable_summary():
+    """Return outstanding receivables grouped by customer."""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT c.id customer_id,c.code customer_code,c.name customer_name,
+               COUNT(o.id) order_count,
+               COALESCE(SUM(o.total_amount),0) total_amount,
+               COALESCE(SUM(o.settled_amount),0) settled_amount,
+               COALESCE(SUM(o.total_amount-o.settled_amount),0) outstanding
+        FROM outbound_orders o
+        JOIN customers c ON c.id=o.customer_id
+        WHERE o.status IN ('已确认','已生效')
+          AND o.total_amount-o.settled_amount>0
+        GROUP BY c.id,c.code,c.name
+        ORDER BY outstanding DESC,c.id
+    """).fetchall()
+    conn.close()
+    return rows
 
 
 def settle(customer_id, settlement_date, method, operator, remark, allocations: dict[int,float]):
@@ -149,14 +180,14 @@ def dashboard():
     conn=get_conn()
     today=date.today().isoformat(); month=date.today().strftime("%Y-%m")
     vals={
-        "inbound_today": conn.execute("SELECT COUNT(*) FROM inbound_orders WHERE order_date=? AND status='已确认'",(today,)).fetchone()[0],
-        "outbound_today": conn.execute("SELECT COUNT(*) FROM outbound_orders WHERE order_date=? AND status='已确认'",(today,)).fetchone()[0],
+        "inbound_today": conn.execute("SELECT COUNT(*) FROM inbound_orders WHERE order_date=? AND status IN ('已确认','已生效')",(today,)).fetchone()[0],
+        "outbound_today": conn.execute("SELECT COUNT(*) FROM outbound_orders WHERE order_date=? AND status IN ('已确认','已生效')",(today,)).fetchone()[0],
         "settlement_today": conn.execute("SELECT COUNT(*) FROM settlements WHERE settlement_date=?",(today,)).fetchone()[0],
-        "outbound_today_amount": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE order_date=? AND status='已确认'",(today,)).fetchone()[0],
+        "outbound_today_amount": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE order_date=? AND status IN ('已确认','已生效')",(today,)).fetchone()[0],
         "inventory_total": conn.execute("SELECT COALESCE(SUM(qty),0) FROM inventory_txns").fetchone()[0],
         "product_types": conn.execute("SELECT COUNT(*) FROM products WHERE status='启用'").fetchone()[0],
-        "receivable": conn.execute("SELECT COALESCE(SUM(total_amount-settled_amount),0) FROM outbound_orders WHERE status='已确认'").fetchone()[0],
-        "month_new_ar": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE status='已确认' AND substr(order_date,1,7)=?",(month,)).fetchone()[0],
+        "receivable": conn.execute("SELECT COALESCE(SUM(total_amount-settled_amount),0) FROM outbound_orders WHERE status IN ('已确认','已生效')").fetchone()[0],
+        "month_new_ar": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE status IN ('已确认','已生效') AND substr(order_date,1,7)=?",(month,)).fetchone()[0],
         "month_settled": conn.execute("SELECT COALESCE(SUM(amount),0) FROM settlements WHERE substr(settlement_date,1,7)=?",(month,)).fetchone()[0],
     }
     conn.close(); return vals
