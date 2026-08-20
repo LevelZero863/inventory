@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from datetime import date
 from collections import defaultdict
+from datetime import date
+import sqlite3
 from typing import Iterable
 
 from db import get_conn
+
+
+def _raise_friendly_unique_error(exc: sqlite3.IntegrityError, entity: str) -> None:
+    if "unique" in str(exc).lower():
+        raise ValueError(f"{entity}编码已存在，请使用其他编码") from exc
+    raise exc
 
 
 def next_no(prefix: str) -> str:
@@ -15,12 +22,24 @@ def next_no(prefix: str) -> str:
     return f"{prefix}{today}{int(row[0] or 0) + 1:03d}"
 
 
-def list_products():
-    conn = get_conn(); rows = conn.execute("SELECT * FROM products ORDER BY id DESC").fetchall(); conn.close(); return rows
+def list_products(active_only: bool = False):
+    conn = get_conn()
+    sql = "SELECT * FROM products"
+    if active_only:
+        sql += " WHERE status='启用'"
+    rows = conn.execute(sql + " ORDER BY id DESC").fetchall()
+    conn.close()
+    return rows
 
 
-def list_customers():
-    conn = get_conn(); rows = conn.execute("SELECT * FROM customers ORDER BY id DESC").fetchall(); conn.close(); return rows
+def list_customers(active_only: bool = False):
+    conn = get_conn()
+    sql = "SELECT * FROM customers"
+    if active_only:
+        sql += " WHERE status='启用'"
+    rows = conn.execute(sql + " ORDER BY id DESC").fetchall()
+    conn.close()
+    return rows
 
 
 def list_warehouses():
@@ -28,17 +47,110 @@ def list_warehouses():
 
 
 def add_product(code, name, spec, unit, price, status="启用", remark=""):
-    conn = get_conn(); conn.execute("INSERT INTO products(code,name,spec,unit,default_price,status,remark) VALUES(?,?,?,?,?,?,?)", (code,name,spec,unit,price,status,remark)); conn.commit(); conn.close()
+    code, name, unit = str(code).strip(), str(name).strip(), str(unit).strip()
+    if not code or not name or not unit:
+        raise ValueError("产品编码、产品名称和单位不能为空")
+    if float(price) < 0:
+        raise ValueError("默认单价不得小于 0")
+    if status not in {"启用", "停用"}:
+        raise ValueError("产品状态无效")
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO products(code,name,spec,unit,default_price,status,remark) VALUES(?,?,?,?,?,?,?)",
+            (code, name, str(spec).strip(), unit, float(price), status, str(remark).strip()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        _raise_friendly_unique_error(exc, "产品")
+    finally:
+        conn.close()
+
+
+def update_product(product_id, code, name, spec, unit, price, status, remark=""):
+    code, name, unit = str(code).strip(), str(name).strip(), str(unit).strip()
+    if not code or not name or not unit:
+        raise ValueError("产品编码、产品名称和单位不能为空")
+    if float(price) < 0:
+        raise ValueError("默认单价不得小于 0")
+    if status not in {"启用", "停用"}:
+        raise ValueError("产品状态无效")
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """UPDATE products
+               SET code=?,name=?,spec=?,unit=?,default_price=?,status=?,remark=?
+               WHERE id=?""",
+            (code, name, str(spec).strip(), unit, float(price), status, str(remark).strip(), int(product_id)),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("产品不存在")
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        _raise_friendly_unique_error(exc, "产品")
+    finally:
+        conn.close()
 
 
 def add_customer(code, name, contact, phone, address, method, status="启用", remark=""):
-    conn = get_conn(); conn.execute("INSERT INTO customers(code,name,contact,phone,address,settlement_method,status,remark) VALUES(?,?,?,?,?,?,?,?)", (code,name,contact,phone,address,method,status,remark)); conn.commit(); conn.close()
+    code, name = str(code).strip(), str(name).strip()
+    if not code or not name:
+        raise ValueError("客户编码和客户名称不能为空")
+    if method not in {"现结", "月结"}:
+        raise ValueError("结算方式无效")
+    if status not in {"启用", "停用"}:
+        raise ValueError("客户状态无效")
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO customers(
+                   code,name,contact,phone,address,settlement_method,status,remark
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                code, name, str(contact).strip(), str(phone).strip(), str(address).strip(),
+                method, status, str(remark).strip(),
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        _raise_friendly_unique_error(exc, "客户")
+    finally:
+        conn.close()
+
+
+def update_customer(customer_id, code, name, contact, phone, address, method, status, remark=""):
+    code, name = str(code).strip(), str(name).strip()
+    if not code or not name:
+        raise ValueError("客户编码和客户名称不能为空")
+    if method not in {"现结", "月结"}:
+        raise ValueError("结算方式无效")
+    if status not in {"启用", "停用"}:
+        raise ValueError("客户状态无效")
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """UPDATE customers
+               SET code=?,name=?,contact=?,phone=?,address=?,settlement_method=?,status=?,remark=?
+               WHERE id=?""",
+            (
+                code, name, str(contact).strip(), str(phone).strip(), str(address).strip(),
+                method, status, str(remark).strip(), int(customer_id),
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("客户不存在")
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        _raise_friendly_unique_error(exc, "客户")
+    finally:
+        conn.close()
 
 
 def inventory_rows():
     conn = get_conn()
     rows = conn.execute("""
-        SELECT p.code product_code,p.name product_name,p.spec,p.unit,t.warehouse,
+        SELECT p.code product_code,p.name product_name,p.spec,p.unit,
+               COALESCE(t.warehouse,'暂无库存') warehouse,
                COALESCE(SUM(t.qty),0) current_qty,COALESCE(SUM(t.qty),0) available_qty
         FROM products p LEFT JOIN inventory_txns t ON t.product_id=p.id
         GROUP BY p.id,t.warehouse ORDER BY p.code,t.warehouse
@@ -48,6 +160,21 @@ def inventory_rows():
 
 def stock(product_id: int, warehouse: str) -> float:
     conn = get_conn(); row = conn.execute("SELECT COALESCE(SUM(qty),0) FROM inventory_txns WHERE product_id=? AND warehouse=?", (product_id, warehouse)).fetchone(); conn.close(); return float(row[0])
+
+
+def _validate_active_products(items: list[dict]) -> None:
+    product_ids = sorted({int(item["product_id"]) for item in items})
+    placeholders = ",".join("?" for _ in product_ids)
+    conn = get_conn()
+    rows = conn.execute(
+        f"SELECT id FROM products WHERE status='启用' AND id IN ({placeholders})",
+        product_ids,
+    ).fetchall()
+    conn.close()
+    active_ids = {int(row[0]) for row in rows}
+    missing = [product_id for product_id in product_ids if product_id not in active_ids]
+    if missing:
+        raise ValueError(f"产品ID {missing[0]} 不存在或已停用")
 
 
 def create_inbound(order_date, supplier, warehouse, operator, remark, items: Iterable[dict], confirm=None):
@@ -60,6 +187,7 @@ def create_inbound(order_date, supplier, warehouse, operator, remark, items: Ite
     if not items: raise ValueError("至少需要一条入库明细")
     if any(i["quantity"] <= 0 for i in items): raise ValueError("入库数量必须大于0")
     if any(i["price"] < 0 for i in items): raise ValueError("单价不得小于0")
+    _validate_active_products(items)
     total = sum(i["quantity"] * i["price"] for i in items)
     no = next_no("RK")
     conn = get_conn()
@@ -88,6 +216,15 @@ def create_outbound(order_date, customer_id, warehouse, operator, remark, items:
     items = list(items)
     if not items: raise ValueError("至少需要一条出库明细")
     if any(i["quantity"] <= 0 for i in items): raise ValueError("出库数量必须大于0")
+    if any(i["price"] < 0 for i in items): raise ValueError("单价不得小于0")
+    _validate_active_products(items)
+    conn = get_conn()
+    customer = conn.execute(
+        "SELECT 1 FROM customers WHERE id=? AND status='启用'", (int(customer_id),)
+    ).fetchone()
+    conn.close()
+    if not customer:
+        raise ValueError("客户不存在或已停用")
     required = defaultdict(float)
     for i in items:
         required[int(i["product_id"])] += float(i["quantity"])
@@ -157,6 +294,8 @@ def settle(customer_id, settlement_date, method, operator, remark, allocations: 
             row=conn.execute("SELECT customer_id,total_amount,settled_amount,status FROM outbound_orders WHERE id=?",(oid,)).fetchone()
             if not row: raise ValueError("出库单不存在")
             if row[0] != customer_id: raise ValueError("只能结算当前客户的出库单")
+            if row[3] not in {"已确认", "已生效"}:
+                raise ValueError("只能结算已生效的出库单")
             outstanding=row[1]-row[2]
             if amount<=0 or amount>outstanding+1e-9: raise ValueError(f"出库单 {oid} 本次结算金额超过未结算金额")
             total+=amount
@@ -201,3 +340,16 @@ def outbound_list():
 
 def inbound_list():
     conn=get_conn(); rows=conn.execute("SELECT order_no,order_date,supplier,warehouse,total_amount,operator,status FROM inbound_orders ORDER BY id DESC").fetchall(); conn.close(); return rows
+
+
+def settlement_list():
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT s.settlement_no,s.settlement_date,c.name customer_name,s.method,
+               s.amount,s.operator,s.remark
+        FROM settlements s
+        JOIN customers c ON c.id=s.customer_id
+        ORDER BY s.id DESC
+    """).fetchall()
+    conn.close()
+    return rows
