@@ -5,7 +5,9 @@ from datetime import date
 import sqlite3
 from typing import Iterable
 
+from audit import write_audit
 from db import get_conn
+from permissions import require_permission
 
 
 def _raise_friendly_unique_error(exc: sqlite3.IntegrityError, entity: str) -> None:
@@ -46,28 +48,8 @@ def list_warehouses():
     conn = get_conn(); rows = conn.execute("SELECT name FROM warehouses ORDER BY id").fetchall(); conn.close(); return [r[0] for r in rows]
 
 
-def add_product(code, name, spec, unit, price, status="启用", remark=""):
-    code, name, unit = str(code).strip(), str(name).strip(), str(unit).strip()
-    if not code or not name or not unit:
-        raise ValueError("产品编码、产品名称和单位不能为空")
-    if float(price) < 0:
-        raise ValueError("默认单价不得小于 0")
-    if status not in {"启用", "停用"}:
-        raise ValueError("产品状态无效")
-    conn = get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO products(code,name,spec,unit,default_price,status,remark) VALUES(?,?,?,?,?,?,?)",
-            (code, name, str(spec).strip(), unit, float(price), status, str(remark).strip()),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError as exc:
-        _raise_friendly_unique_error(exc, "产品")
-    finally:
-        conn.close()
-
-
-def update_product(product_id, code, name, spec, unit, price, status, remark=""):
+def add_product(code, name, spec, unit, price, status="启用", remark="", actor=None):
+    require_permission(actor, "manage_master")
     code, name, unit = str(code).strip(), str(name).strip(), str(unit).strip()
     if not code or not name or not unit:
         raise ValueError("产品编码、产品名称和单位不能为空")
@@ -78,13 +60,16 @@ def update_product(product_id, code, name, spec, unit, price, status, remark="")
     conn = get_conn()
     try:
         cur = conn.execute(
-            """UPDATE products
-               SET code=?,name=?,spec=?,unit=?,default_price=?,status=?,remark=?
-               WHERE id=?""",
-            (code, name, str(spec).strip(), unit, float(price), status, str(remark).strip(), int(product_id)),
+            "INSERT INTO products(code,name,spec,unit,default_price,status,remark) VALUES(?,?,?,?,?,?,?)",
+            (code, name, str(spec).strip(), unit, float(price), status, str(remark).strip()),
         )
-        if cur.rowcount != 1:
-            raise ValueError("产品不存在")
+        product_id = int(cur.lastrowid)
+        write_audit(
+            "新增产品", actor, entity_type="产品", entity_id=product_id, source_no=code,
+            after={"code": code, "name": name, "spec": str(spec).strip(), "unit": unit,
+                   "default_price": float(price), "status": status, "remark": str(remark).strip()},
+            conn=conn,
+        )
         conn.commit()
     except sqlite3.IntegrityError as exc:
         _raise_friendly_unique_error(exc, "产品")
@@ -92,7 +77,43 @@ def update_product(product_id, code, name, spec, unit, price, status, remark="")
         conn.close()
 
 
-def add_customer(code, name, contact, phone, address, method, status="启用", remark=""):
+def update_product(product_id, code, name, spec, unit, price, status, remark="", actor=None):
+    require_permission(actor, "manage_master")
+    code, name, unit = str(code).strip(), str(name).strip(), str(unit).strip()
+    if not code or not name or not unit:
+        raise ValueError("产品编码、产品名称和单位不能为空")
+    if float(price) < 0:
+        raise ValueError("默认单价不得小于 0")
+    if status not in {"启用", "停用"}:
+        raise ValueError("产品状态无效")
+    conn = get_conn()
+    try:
+        before = conn.execute("SELECT * FROM products WHERE id=?", (int(product_id),)).fetchone()
+        if not before:
+            raise ValueError("产品不存在")
+        cur = conn.execute(
+            """UPDATE products
+               SET code=?,name=?,spec=?,unit=?,default_price=?,status=?,remark=?
+               WHERE id=?""",
+            (code, name, str(spec).strip(), unit, float(price), status, str(remark).strip(), int(product_id)),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("产品不存在")
+        after = conn.execute("SELECT * FROM products WHERE id=?", (int(product_id),)).fetchone()
+        if dict(before) != dict(after):
+            write_audit(
+                "修改产品", actor, entity_type="产品", entity_id=int(product_id), source_no=code,
+                before=before, after=after, conn=conn,
+            )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        _raise_friendly_unique_error(exc, "产品")
+    finally:
+        conn.close()
+
+
+def add_customer(code, name, contact, phone, address, method, status="启用", remark="", actor=None):
+    require_permission(actor, "manage_master")
     code, name = str(code).strip(), str(name).strip()
     if not code or not name:
         raise ValueError("客户编码和客户名称不能为空")
@@ -102,7 +123,7 @@ def add_customer(code, name, contact, phone, address, method, status="启用", r
         raise ValueError("客户状态无效")
     conn = get_conn()
     try:
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO customers(
                    code,name,contact,phone,address,settlement_method,status,remark
                ) VALUES(?,?,?,?,?,?,?,?)""",
@@ -111,6 +132,14 @@ def add_customer(code, name, contact, phone, address, method, status="启用", r
                 method, status, str(remark).strip(),
             ),
         )
+        customer_id = int(cur.lastrowid)
+        write_audit(
+            "新增客户", actor, entity_type="客户", entity_id=customer_id, source_no=code,
+            after={"code": code, "name": name, "contact": str(contact).strip(),
+                   "phone": str(phone).strip(), "address": str(address).strip(),
+                   "settlement_method": method, "status": status, "remark": str(remark).strip()},
+            conn=conn,
+        )
         conn.commit()
     except sqlite3.IntegrityError as exc:
         _raise_friendly_unique_error(exc, "客户")
@@ -118,7 +147,8 @@ def add_customer(code, name, contact, phone, address, method, status="启用", r
         conn.close()
 
 
-def update_customer(customer_id, code, name, contact, phone, address, method, status, remark=""):
+def update_customer(customer_id, code, name, contact, phone, address, method, status, remark="", actor=None):
+    require_permission(actor, "manage_master")
     code, name = str(code).strip(), str(name).strip()
     if not code or not name:
         raise ValueError("客户编码和客户名称不能为空")
@@ -128,6 +158,9 @@ def update_customer(customer_id, code, name, contact, phone, address, method, st
         raise ValueError("客户状态无效")
     conn = get_conn()
     try:
+        before = conn.execute("SELECT * FROM customers WHERE id=?", (int(customer_id),)).fetchone()
+        if not before:
+            raise ValueError("客户不存在")
         cur = conn.execute(
             """UPDATE customers
                SET code=?,name=?,contact=?,phone=?,address=?,settlement_method=?,status=?,remark=?
@@ -139,6 +172,12 @@ def update_customer(customer_id, code, name, contact, phone, address, method, st
         )
         if cur.rowcount != 1:
             raise ValueError("客户不存在")
+        after = conn.execute("SELECT * FROM customers WHERE id=?", (int(customer_id),)).fetchone()
+        if dict(before) != dict(after):
+            write_audit(
+                "修改客户", actor, entity_type="客户", entity_id=int(customer_id), source_no=code,
+                before=before, after=after, conn=conn,
+            )
         conn.commit()
     except sqlite3.IntegrityError as exc:
         _raise_friendly_unique_error(exc, "客户")
@@ -177,12 +216,13 @@ def _validate_active_products(items: list[dict]) -> None:
         raise ValueError(f"产品ID {missing[0]} 不存在或已停用")
 
 
-def create_inbound(order_date, supplier, warehouse, operator, remark, items: Iterable[dict], confirm=None):
+def create_inbound(order_date, supplier, warehouse, operator, remark, items: Iterable[dict], confirm=None, actor=None):
     """Create an inbound order and apply it immediately.
 
     ``confirm`` is retained only for compatibility with V1.0.1 callers. New
     orders no longer have a draft state.
     """
+    require_permission(actor, "create_inbound")
     items = list(items)
     if not items: raise ValueError("至少需要一条入库明细")
     if any(i["quantity"] <= 0 for i in items): raise ValueError("入库数量必须大于0")
@@ -200,6 +240,13 @@ def create_inbound(order_date, supplier, warehouse, operator, remark, items: Ite
             conn.execute("INSERT INTO inbound_items(order_id,product_id,quantity,price,amount) VALUES(?,?,?,?,?)", (oid,i["product_id"],i["quantity"],i["price"],amount))
             conn.execute("INSERT INTO inventory_txns(txn_date,warehouse,product_id,qty,txn_type,source_no) VALUES(?,?,?,?,?,?)", (order_date,warehouse,i["product_id"],i["quantity"],"入库",no))
         conn.execute("INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)", ("入库生效",no,operator,""))
+        write_audit(
+            "入库单生效", actor, entity_type="入库单", entity_id=oid, source_no=no,
+            after={"order_no": no, "order_date": order_date, "supplier": supplier,
+                   "warehouse": warehouse, "operator": operator, "remark": remark,
+                   "status": "已生效", "total_amount": total, "items": items},
+            conn=conn,
+        )
         conn.commit()
     except Exception:
         conn.rollback(); raise
@@ -207,12 +254,13 @@ def create_inbound(order_date, supplier, warehouse, operator, remark, items: Ite
     return no
 
 
-def create_outbound(order_date, customer_id, warehouse, operator, remark, items: Iterable[dict], confirm=None):
+def create_outbound(order_date, customer_id, warehouse, operator, remark, items: Iterable[dict], confirm=None, actor=None):
     """Create an outbound order and apply it immediately.
 
     ``confirm`` is retained only for compatibility with V1.0.1 callers. New
     orders no longer have a draft state.
     """
+    require_permission(actor, "create_outbound")
     items = list(items)
     if not items: raise ValueError("至少需要一条出库明细")
     if any(i["quantity"] <= 0 for i in items): raise ValueError("出库数量必须大于0")
@@ -243,6 +291,13 @@ def create_outbound(order_date, customer_id, warehouse, operator, remark, items:
             conn.execute("INSERT INTO outbound_items(order_id,product_id,quantity,price,amount) VALUES(?,?,?,?,?)", (oid,i["product_id"],i["quantity"],i["price"],amount))
             conn.execute("INSERT INTO inventory_txns(txn_date,warehouse,product_id,qty,txn_type,source_no) VALUES(?,?,?,?,?,?)", (order_date,warehouse,i["product_id"],-i["quantity"],"出库",no))
         conn.execute("INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)", ("出库生效",no,operator,""))
+        write_audit(
+            "出库单生效", actor, entity_type="出库单", entity_id=oid, source_no=no,
+            after={"order_no": no, "order_date": order_date, "customer_id": int(customer_id),
+                   "warehouse": warehouse, "operator": operator, "remark": remark,
+                   "status": "已生效", "total_amount": total, "items": items},
+            conn=conn,
+        )
         conn.commit()
     except Exception:
         conn.rollback(); raise
@@ -283,7 +338,8 @@ def receivable_summary():
     return rows
 
 
-def settle(customer_id, settlement_date, method, operator, remark, allocations: dict[int,float]):
+def settle(customer_id, settlement_date, method, operator, remark, allocations: dict[int,float], actor=None):
+    require_permission(actor, "create_settlement")
     allocations={int(k):float(v) for k,v in allocations.items() if float(v)>0}
     if not allocations: raise ValueError("至少选择一张出库单并填写结算金额")
     conn=get_conn()
@@ -308,11 +364,236 @@ def settle(customer_id, settlement_date, method, operator, remark, allocations: 
             new_settled=row[1]+amount
             conn.execute("UPDATE outbound_orders SET settled_amount=? WHERE id=?",(new_settled,oid))
         conn.execute("INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)",("结算",no,operator,f"金额 {total:.2f}"))
+        write_audit(
+            "结算单生效", actor, entity_type="结算单", entity_id=sid, source_no=no,
+            after={"settlement_no": no, "settlement_date": settlement_date,
+                   "customer_id": int(customer_id), "method": method, "amount": total,
+                   "operator": operator, "remark": remark, "status": "已生效",
+                   "allocations": allocations},
+            conn=conn,
+        )
         conn.commit()
     except Exception:
         conn.rollback(); raise
     finally: conn.close()
     return no
+
+
+def void_inbound(order_id: int, reason: str, actor=None) -> None:
+    require_permission(actor, "void_inbound")
+    reason = str(reason).strip()
+    if len(reason) < 3:
+        raise ValueError("作废原因至少填写 3 个字")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute("SELECT * FROM inbound_orders WHERE id=?", (int(order_id),)).fetchone()
+        if not order:
+            raise ValueError("入库单不存在")
+        if order["status"] not in {"已确认", "已生效"}:
+            raise ValueError("只有已生效的入库单可以作废")
+        items = conn.execute(
+            "SELECT product_id,SUM(quantity) quantity FROM inbound_items WHERE order_id=? GROUP BY product_id",
+            (int(order_id),),
+        ).fetchall()
+        for item in items:
+            current = conn.execute(
+                "SELECT COALESCE(SUM(qty),0) FROM inventory_txns WHERE product_id=? AND warehouse=?",
+                (item["product_id"], order["warehouse"]),
+            ).fetchone()[0]
+            if float(current) + 1e-9 < float(item["quantity"]):
+                raise ValueError("该入库单对应库存已被使用，不能直接作废；请先处理后续出库")
+        for item in items:
+            conn.execute(
+                """INSERT INTO inventory_txns(
+                       txn_date,warehouse,product_id,qty,txn_type,source_no
+                   ) VALUES(?,?,?,?,?,?)""",
+                (date.today().isoformat(), order["warehouse"], item["product_id"],
+                 -float(item["quantity"]), "入库作废", order["order_no"]),
+            )
+        actor_name = (actor or {}).get("username") or "system"
+        conn.execute(
+            """UPDATE inbound_orders SET status='已作废',void_reason=?,
+                      voided_at=CURRENT_TIMESTAMP,voided_by=? WHERE id=?""",
+            (reason, actor_name, int(order_id)),
+        )
+        after = conn.execute("SELECT * FROM inbound_orders WHERE id=?", (int(order_id),)).fetchone()
+        conn.execute(
+            "INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)",
+            ("入库作废", order["order_no"], actor_name, reason),
+        )
+        write_audit(
+            "作废入库单", actor, entity_type="入库单", entity_id=int(order_id),
+            source_no=order["order_no"], before=order, after=after, detail=reason, conn=conn,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def void_outbound(order_id: int, reason: str, actor=None) -> None:
+    require_permission(actor, "void_outbound")
+    reason = str(reason).strip()
+    if len(reason) < 3:
+        raise ValueError("作废原因至少填写 3 个字")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute("SELECT * FROM outbound_orders WHERE id=?", (int(order_id),)).fetchone()
+        if not order:
+            raise ValueError("出库单不存在")
+        if order["status"] not in {"已确认", "已生效"}:
+            raise ValueError("只有已生效的出库单可以作废")
+        if float(order["settled_amount"]) > 1e-9:
+            raise ValueError("该出库单已有结算记录，请先作废关联结算单")
+        items = conn.execute(
+            "SELECT product_id,SUM(quantity) quantity FROM outbound_items WHERE order_id=? GROUP BY product_id",
+            (int(order_id),),
+        ).fetchall()
+        for item in items:
+            conn.execute(
+                """INSERT INTO inventory_txns(
+                       txn_date,warehouse,product_id,qty,txn_type,source_no
+                   ) VALUES(?,?,?,?,?,?)""",
+                (date.today().isoformat(), order["warehouse"], item["product_id"],
+                 float(item["quantity"]), "出库作废", order["order_no"]),
+            )
+        actor_name = (actor or {}).get("username") or "system"
+        conn.execute(
+            """UPDATE outbound_orders SET status='已作废',void_reason=?,
+                      voided_at=CURRENT_TIMESTAMP,voided_by=? WHERE id=?""",
+            (reason, actor_name, int(order_id)),
+        )
+        after = conn.execute("SELECT * FROM outbound_orders WHERE id=?", (int(order_id),)).fetchone()
+        conn.execute(
+            "INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)",
+            ("出库作废", order["order_no"], actor_name, reason),
+        )
+        write_audit(
+            "作废出库单", actor, entity_type="出库单", entity_id=int(order_id),
+            source_no=order["order_no"], before=order, after=after, detail=reason, conn=conn,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def void_settlement(settlement_id: int, reason: str, actor=None) -> None:
+    require_permission(actor, "void_settlement")
+    reason = str(reason).strip()
+    if len(reason) < 3:
+        raise ValueError("作废原因至少填写 3 个字")
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        settlement = conn.execute(
+            "SELECT * FROM settlements WHERE id=?", (int(settlement_id),)
+        ).fetchone()
+        if not settlement:
+            raise ValueError("结算单不存在")
+        if settlement["status"] != "已生效":
+            raise ValueError("只有已生效的结算单可以作废")
+        allocations = conn.execute(
+            "SELECT outbound_order_id,amount FROM settlement_items WHERE settlement_id=?",
+            (int(settlement_id),),
+        ).fetchall()
+        for allocation in allocations:
+            row = conn.execute(
+                "SELECT settled_amount,status FROM outbound_orders WHERE id=?",
+                (allocation["outbound_order_id"],),
+            ).fetchone()
+            if not row or row["status"] not in {"已确认", "已生效"}:
+                raise ValueError("关联出库单状态异常，不能作废结算单")
+            if float(row["settled_amount"]) + 1e-9 < float(allocation["amount"]):
+                raise ValueError("关联出库单已结算金额异常，不能作废结算单")
+            conn.execute(
+                "UPDATE outbound_orders SET settled_amount=settled_amount-? WHERE id=?",
+                (float(allocation["amount"]), allocation["outbound_order_id"]),
+            )
+        actor_name = (actor or {}).get("username") or "system"
+        conn.execute(
+            """UPDATE settlements SET status='已作废',void_reason=?,
+                      voided_at=CURRENT_TIMESTAMP,voided_by=? WHERE id=?""",
+            (reason, actor_name, int(settlement_id)),
+        )
+        after = conn.execute("SELECT * FROM settlements WHERE id=?", (int(settlement_id),)).fetchone()
+        conn.execute(
+            "INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)",
+            ("结算作废", settlement["settlement_no"], actor_name, reason),
+        )
+        write_audit(
+            "作废结算单", actor, entity_type="结算单", entity_id=int(settlement_id),
+            source_no=settlement["settlement_no"], before=settlement, after=after,
+            detail=reason, conn=conn,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def inbound_detail(order_id: int):
+    conn = get_conn()
+    try:
+        header = conn.execute("SELECT * FROM inbound_orders WHERE id=?", (int(order_id),)).fetchone()
+        items = conn.execute(
+            """SELECT p.code product_code,p.name product_name,p.spec,p.unit,
+                      i.quantity,i.price,i.amount
+               FROM inbound_items i JOIN products p ON p.id=i.product_id
+               WHERE i.order_id=? ORDER BY i.id""",
+            (int(order_id),),
+        ).fetchall()
+        return header, items
+    finally:
+        conn.close()
+
+
+def outbound_detail(order_id: int):
+    conn = get_conn()
+    try:
+        header = conn.execute(
+            """SELECT o.*,c.code customer_code,c.name customer_name
+               FROM outbound_orders o JOIN customers c ON c.id=o.customer_id WHERE o.id=?""",
+            (int(order_id),),
+        ).fetchone()
+        items = conn.execute(
+            """SELECT p.code product_code,p.name product_name,p.spec,p.unit,
+                      i.quantity,i.price,i.amount
+               FROM outbound_items i JOIN products p ON p.id=i.product_id
+               WHERE i.order_id=? ORDER BY i.id""",
+            (int(order_id),),
+        ).fetchall()
+        return header, items
+    finally:
+        conn.close()
+
+
+def settlement_detail(settlement_id: int):
+    conn = get_conn()
+    try:
+        header = conn.execute(
+            """SELECT s.*,c.code customer_code,c.name customer_name
+               FROM settlements s JOIN customers c ON c.id=s.customer_id WHERE s.id=?""",
+            (int(settlement_id),),
+        ).fetchone()
+        items = conn.execute(
+            """SELECT o.order_no,o.order_date,si.amount
+               FROM settlement_items si
+               JOIN outbound_orders o ON o.id=si.outbound_order_id
+               WHERE si.settlement_id=? ORDER BY si.id""",
+            (int(settlement_id),),
+        ).fetchall()
+        return header, items
+    finally:
+        conn.close()
 
 
 def dashboard():
@@ -321,32 +602,32 @@ def dashboard():
     vals={
         "inbound_today": conn.execute("SELECT COUNT(*) FROM inbound_orders WHERE order_date=? AND status IN ('已确认','已生效')",(today,)).fetchone()[0],
         "outbound_today": conn.execute("SELECT COUNT(*) FROM outbound_orders WHERE order_date=? AND status IN ('已确认','已生效')",(today,)).fetchone()[0],
-        "settlement_today": conn.execute("SELECT COUNT(*) FROM settlements WHERE settlement_date=?",(today,)).fetchone()[0],
+        "settlement_today": conn.execute("SELECT COUNT(*) FROM settlements WHERE settlement_date=? AND status='已生效'",(today,)).fetchone()[0],
         "outbound_today_amount": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE order_date=? AND status IN ('已确认','已生效')",(today,)).fetchone()[0],
         "inventory_total": conn.execute("SELECT COALESCE(SUM(qty),0) FROM inventory_txns").fetchone()[0],
         "product_types": conn.execute("SELECT COUNT(*) FROM products WHERE status='启用'").fetchone()[0],
         "receivable": conn.execute("SELECT COALESCE(SUM(total_amount-settled_amount),0) FROM outbound_orders WHERE status IN ('已确认','已生效')").fetchone()[0],
         "month_new_ar": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE status IN ('已确认','已生效') AND substr(order_date,1,7)=?",(month,)).fetchone()[0],
-        "month_settled": conn.execute("SELECT COALESCE(SUM(amount),0) FROM settlements WHERE substr(settlement_date,1,7)=?",(month,)).fetchone()[0],
+        "month_settled": conn.execute("SELECT COALESCE(SUM(amount),0) FROM settlements WHERE status='已生效' AND substr(settlement_date,1,7)=?",(month,)).fetchone()[0],
     }
     conn.close(); return vals
 
 
 def outbound_list():
-    conn=get_conn(); rows=conn.execute("""SELECT o.order_no,o.order_date,c.name customer_name,o.total_amount,o.settled_amount,
+    conn=get_conn(); rows=conn.execute("""SELECT o.id,o.order_no,o.order_date,c.name customer_name,o.total_amount,o.settled_amount,
     o.total_amount-o.settled_amount outstanding,CASE WHEN o.settled_amount<=0 THEN '未结算' WHEN o.settled_amount<o.total_amount THEN '部分结算' ELSE '已结算' END settlement_status,o.status
     FROM outbound_orders o JOIN customers c ON c.id=o.customer_id ORDER BY o.id DESC""").fetchall(); conn.close(); return rows
 
 
 def inbound_list():
-    conn=get_conn(); rows=conn.execute("SELECT order_no,order_date,supplier,warehouse,total_amount,operator,status FROM inbound_orders ORDER BY id DESC").fetchall(); conn.close(); return rows
+    conn=get_conn(); rows=conn.execute("SELECT id,order_no,order_date,supplier,warehouse,total_amount,operator,status FROM inbound_orders ORDER BY id DESC").fetchall(); conn.close(); return rows
 
 
 def settlement_list():
     conn = get_conn()
     rows = conn.execute("""
-        SELECT s.settlement_no,s.settlement_date,c.name customer_name,s.method,
-               s.amount,s.operator,s.remark
+        SELECT s.id,s.settlement_no,s.settlement_date,c.name customer_name,s.method,
+               s.amount,s.operator,s.status,s.remark
         FROM settlements s
         JOIN customers c ON c.id=s.customer_id
         ORDER BY s.id DESC

@@ -5,32 +5,45 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
+from audit import list_audit_logs, write_audit
 from auth import (
     INITIAL_ADMIN_PASSWORD,
     INITIAL_ADMIN_USERNAME,
     authenticate,
     change_password,
+    create_user,
     ensure_initial_admin,
+    get_active_user,
+    list_users,
+    reset_user_password,
+    update_user,
 )
 from db import DB_PATH, backup_database, init_db, integrity_check
+from permissions import ROLE_LABELS, has_permission
 from services import (
     add_customer,
     add_product,
     create_inbound,
     create_outbound,
     dashboard,
+    inbound_detail,
     inbound_list,
     inventory_rows,
     list_customers,
     list_products,
     list_warehouses,
     open_receivables,
+    outbound_detail,
     outbound_list,
     receivable_summary,
     settle,
+    settlement_detail,
     settlement_list,
     update_customer,
     update_product,
+    void_inbound,
+    void_outbound,
+    void_settlement,
 )
 
 st.set_page_config(page_title="库存管理系统", page_icon="📦", layout="wide")
@@ -71,7 +84,7 @@ def render_forced_password_change(user):
             st.error("两次输入的密码不一致")
         else:
             try:
-                change_password(int(user["id"]), new_password)
+                change_password(int(user["id"]), new_password, actor=user)
                 user["must_change_password"] = False
                 st.session_state["auth_user"] = user
                 st.success("密码修改成功")
@@ -83,6 +96,14 @@ def render_forced_password_change(user):
 if "auth_user" not in st.session_state:
     render_login()
     st.stop()
+
+fresh_user = get_active_user(int(st.session_state["auth_user"]["id"]))
+if not fresh_user:
+    st.session_state.pop("auth_user", None)
+    st.warning("账号已停用，请联系管理员。")
+    render_login()
+    st.stop()
+st.session_state["auth_user"] = fresh_user
 
 if st.session_state["auth_user"].get("must_change_password"):
     render_forced_password_change(st.session_state["auth_user"])
@@ -99,6 +120,7 @@ INVENTORY_COLUMNS = {
 }
 
 INBOUND_COLUMNS = {
+    "id": "单据ID",
     "order_no": "入库单号",
     "order_date": "入库日期",
     "supplier": "供应商",
@@ -109,6 +131,7 @@ INBOUND_COLUMNS = {
 }
 
 OUTBOUND_COLUMNS = {
+    "id": "单据ID",
     "order_no": "出库单号",
     "order_date": "出库日期",
     "customer_name": "客户名称",
@@ -120,12 +143,14 @@ OUTBOUND_COLUMNS = {
 }
 
 SETTLEMENT_COLUMNS = {
+    "id": "单据ID",
     "settlement_no": "结算单号",
     "settlement_date": "结算日期",
     "customer_name": "客户名称",
     "method": "结算方式",
     "amount": "结算金额",
     "operator": "经办人",
+    "status": "单据状态",
     "remark": "备注",
 }
 
@@ -308,7 +333,10 @@ def inbound_dialog():
     st.metric("入库单总金额", f"¥{inbound_total:,.2f}")
     if st.button("提交并生效", type="primary", key="submit_inbound"):
         try:
-            no = create_inbound(order_date.isoformat(), supplier, warehouse, operator, remark, parse_product_items(edited, product_map))
+            no = create_inbound(
+                order_date.isoformat(), supplier, warehouse, operator, remark,
+                parse_product_items(edited, product_map), actor=st.session_state["auth_user"],
+            )
             _clear_lines("inbound_items")
             st.session_state["flash"] = f"入库单 {no} 已提交并生效"
             st.rerun()
@@ -341,7 +369,7 @@ def outbound_dialog():
         try:
             no = create_outbound(
                 order_date.isoformat(), customer_map[customer_label], warehouse, operator, remark,
-                parse_product_items(edited, product_map),
+                parse_product_items(edited, product_map), actor=st.session_state["auth_user"],
             )
             _clear_lines("outbound_items")
             st.session_state["flash"] = f"出库单 {no} 已提交并生效"
@@ -406,35 +434,77 @@ def settlement_dialog():
                 if float(amount) > float(receivable["outstanding"]):
                     raise ValueError(f"{order_label} 的结算金额超过未收金额")
                 allocations[order_id] = float(amount)
-            no = settle(customer_id, settlement_date.isoformat(), method, operator, remark, allocations)
+            no = settle(
+                customer_id, settlement_date.isoformat(), method, operator, remark, allocations,
+                actor=st.session_state["auth_user"],
+            )
             st.session_state["flash"] = f"结算单 {no} 已提交并生效"
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
 
 
+def render_void_form(label, entity_id, status, permission, handler, actor, key):
+    if status not in {"已确认", "已生效"} or not has_permission(actor, permission):
+        return
+    with st.form(f"void_{key}_{entity_id}"):
+        st.markdown(f"#### 作废{label}")
+        reason = st.text_input("作废原因（必填，至少 3 个字）")
+        confirmed = st.checkbox("我确认该操作将生成反向业务记录，原单据和审计记录会永久保留")
+        submitted = st.form_submit_button(f"确认作废{label}", type="primary")
+        if submitted:
+            if not confirmed:
+                st.error("请先勾选确认项")
+            else:
+                try:
+                    handler(int(entity_id), reason, actor=actor)
+                    st.session_state["flash"] = f"{label}已作废，反向业务记录已生成"
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+
+def detail_items_df(items):
+    return rows_df(items).rename(columns={
+        "product_code": "产品编码", "product_name": "产品名称", "spec": "规格型号",
+        "unit": "单位", "quantity": "数量", "price": "单价", "amount": "金额",
+        "order_no": "出库单号", "order_date": "出库日期",
+    })
+
+
 st.title("📦 库存管理系统")
-st.caption("AI 安全迭代版 V1.3 · Streamlit + SQLite + Migration")
+st.caption("AI 安全迭代版 V1.4 · 权限控制 + 单据生命周期 + 完整审计")
 if message := st.session_state.pop("flash", None):
     st.success(message)
 
 user = st.session_state["auth_user"]
 st.sidebar.write(f"👤 {user['display_name'] or user['username']}")
+st.sidebar.caption(f"角色：{ROLE_LABELS.get(user['role'], user['role'])}")
 if st.sidebar.button("退出登录", width="stretch"):
+    write_audit("退出登录", user, entity_type="用户", entity_id=user["id"], source_no=user["username"])
     st.session_state.pop("auth_user", None)
     st.rerun()
 
 with st.sidebar.expander("🛡️ 数据安全", expanded=False):
     st.caption(f"数据库：{DB_PATH.name}")
-    if st.button("立即备份数据库"):
+    if has_permission(user, "backup_database") and st.button("立即备份数据库"):
         try:
             path = backup_database(label="manual")
+            write_audit("手工备份数据库", user, entity_type="系统", source_no=path.name)
             st.success(f"备份完成：{path.name}")
         except Exception as exc:
             st.error(str(exc))
     st.write("完整性检查：", integrity_check())
 
-menu = st.sidebar.radio("功能菜单", ["首页", "基础资料", "入库管理", "出库管理", "结算管理", "应收账款", "库存查询"])
+menu_options = ["首页"]
+if has_permission(user, "manage_master"):
+    menu_options.append("基础资料")
+menu_options.extend(["入库管理", "出库管理", "结算管理", "应收账款", "库存查询"])
+if has_permission(user, "manage_users"):
+    menu_options.append("用户与权限")
+if has_permission(user, "view_audit"):
+    menu_options.append("审计日志")
+menu = st.sidebar.radio("功能菜单", menu_options)
 
 if menu == "首页":
     data = dashboard()
@@ -472,7 +542,7 @@ elif menu == "基础资料":
                 remark = c6.text_input("备注")
                 if st.form_submit_button("保存产品"):
                     try:
-                        add_product(code, name, spec, unit, price, status, remark)
+                        add_product(code, name, spec, unit, price, status, remark, actor=user)
                         st.success("保存成功")
                         st.rerun()
                     except Exception as exc:
@@ -506,7 +576,7 @@ elif menu == "基础资料":
                     update_product(
                         product["产品ID"], product["产品编码"], product["产品名称"],
                         product["规格型号"], product["单位"], product["默认单价"],
-                        product["状态"], product["备注"],
+                        product["状态"], product["备注"], actor=user,
                     )
                 st.session_state["flash"] = "产品资料已更新"
                 st.rerun()
@@ -527,7 +597,9 @@ elif menu == "基础资料":
                 remark = c6.text_input("备注")
                 if st.form_submit_button("保存客户"):
                     try:
-                        add_customer(code, name, contact, phone, address, method, status, remark)
+                        add_customer(
+                            code, name, contact, phone, address, method, status, remark, actor=user
+                        )
                         st.success("保存成功")
                         st.rerun()
                     except Exception as exc:
@@ -562,7 +634,7 @@ elif menu == "基础资料":
                     update_customer(
                         customer["客户ID"], customer["客户编码"], customer["客户名称"],
                         customer["联系人"], customer["联系电话"], customer["地址"],
-                        customer["结算方式"], customer["状态"], customer["备注"],
+                        customer["结算方式"], customer["状态"], customer["备注"], actor=user,
                     )
                 st.session_state["flash"] = "客户资料已更新"
                 st.rerun()
@@ -571,46 +643,108 @@ elif menu == "基础资料":
 
 elif menu == "入库管理":
     c1, _ = st.columns([1, 5])
-    if c1.button("＋ 新增入库单", type="primary", width="stretch"):
+    if has_permission(user, "create_inbound") and c1.button(
+        "＋ 新增入库单", type="primary", width="stretch"
+    ):
         inbound_dialog()
+    elif not has_permission(user, "create_inbound"):
+        st.caption("当前角色可查看入库单，但无权新增或作废。")
     st.subheader("入库单列表")
     inbound_df = rows_df(inbound_list()).rename(columns=INBOUND_COLUMNS)
     if inbound_df.empty:
         st.info("暂无入库单。")
     else:
-        st.dataframe(
+        event = st.dataframe(
             inbound_df,
+            key="inbound_order_list",
+            on_select="rerun",
+            selection_mode="single-row",
             width="stretch",
             hide_index=True,
             column_config={
+                "单据ID": None,
                 "入库总金额": st.column_config.NumberColumn("入库总金额", format="¥ %.2f")
             },
         )
+        if event.selection.rows:
+            selected = inbound_df.iloc[event.selection.rows[0]]
+            header, items = inbound_detail(int(selected["单据ID"]))
+            st.subheader(f"{header['order_no']}｜入库明细")
+            st.caption(
+                f"日期：{header['order_date']}　供应商：{header['supplier'] or '-'}　"
+                f"仓库：{header['warehouse']}　状态：{header['status']}"
+            )
+            st.dataframe(
+                detail_items_df(items), width="stretch", hide_index=True,
+                column_config={
+                    "单价": st.column_config.NumberColumn("单价", format="¥ %.2f"),
+                    "金额": st.column_config.NumberColumn("金额", format="¥ %.2f"),
+                },
+            )
+            if header["status"] == "已作废":
+                st.warning(f"作废原因：{header['void_reason']}｜操作人：{header['voided_by']}")
+            render_void_form(
+                "入库单", header["id"], header["status"], "void_inbound",
+                void_inbound, user, "inbound",
+            )
 
 elif menu == "出库管理":
     c1, _ = st.columns([1, 5])
-    if c1.button("＋ 新增出库单", type="primary", width="stretch"):
+    if has_permission(user, "create_outbound") and c1.button(
+        "＋ 新增出库单", type="primary", width="stretch"
+    ):
         outbound_dialog()
+    elif not has_permission(user, "create_outbound"):
+        st.caption("当前角色可查看出库单，但无权新增或作废。")
     st.subheader("出库单列表")
     outbound_df = rows_df(outbound_list()).rename(columns=OUTBOUND_COLUMNS)
     if outbound_df.empty:
         st.info("暂无出库单。")
     else:
-        st.dataframe(
+        event = st.dataframe(
             outbound_df,
+            key="outbound_order_list",
+            on_select="rerun",
+            selection_mode="single-row",
             width="stretch",
             hide_index=True,
             column_config={
+                "单据ID": None,
                 "出库总金额": st.column_config.NumberColumn("出库总金额", format="¥ %.2f"),
                 "已结算金额": st.column_config.NumberColumn("已结算金额", format="¥ %.2f"),
                 "未收金额": st.column_config.NumberColumn("未收金额", format="¥ %.2f"),
             },
         )
+        if event.selection.rows:
+            selected = outbound_df.iloc[event.selection.rows[0]]
+            header, items = outbound_detail(int(selected["单据ID"]))
+            st.subheader(f"{header['order_no']}｜出库明细")
+            st.caption(
+                f"日期：{header['order_date']}　客户：{header['customer_name']}　"
+                f"仓库：{header['warehouse']}　状态：{header['status']}"
+            )
+            st.dataframe(
+                detail_items_df(items), width="stretch", hide_index=True,
+                column_config={
+                    "单价": st.column_config.NumberColumn("单价", format="¥ %.2f"),
+                    "金额": st.column_config.NumberColumn("金额", format="¥ %.2f"),
+                },
+            )
+            if header["status"] == "已作废":
+                st.warning(f"作废原因：{header['void_reason']}｜操作人：{header['voided_by']}")
+            render_void_form(
+                "出库单", header["id"], header["status"], "void_outbound",
+                void_outbound, user, "outbound",
+            )
 
 elif menu == "结算管理":
     c1, _ = st.columns([1, 5])
-    if c1.button("＋ 新增结算单", type="primary", width="stretch"):
+    if has_permission(user, "create_settlement") and c1.button(
+        "＋ 新增结算单", type="primary", width="stretch"
+    ):
         settlement_dialog()
+    elif not has_permission(user, "create_settlement"):
+        st.caption("当前角色可查看结算数据，但无权新增或作废结算单。")
     st.subheader("待结算客户")
     summary = rows_df(receivable_summary())
     if summary.empty:
@@ -634,14 +768,37 @@ elif menu == "结算管理":
     if settlements_df.empty:
         st.info("暂无结算单。")
     else:
-        st.dataframe(
+        event = st.dataframe(
             settlements_df,
+            key="settlement_order_list",
+            on_select="rerun",
+            selection_mode="single-row",
             width="stretch",
             hide_index=True,
             column_config={
+                "单据ID": None,
                 "结算金额": st.column_config.NumberColumn("结算金额", format="¥ %.2f")
             },
         )
+        if event.selection.rows:
+            selected = settlements_df.iloc[event.selection.rows[0]]
+            header, items = settlement_detail(int(selected["单据ID"]))
+            st.subheader(f"{header['settlement_no']}｜结算明细")
+            st.caption(
+                f"日期：{header['settlement_date']}　客户：{header['customer_name']}　"
+                f"方式：{header['method']}　状态：{header['status']}"
+            )
+            settlement_items = detail_items_df(items)
+            st.dataframe(
+                settlement_items, width="stretch", hide_index=True,
+                column_config={"金额": st.column_config.NumberColumn("金额", format="¥ %.2f")},
+            )
+            if header["status"] == "已作废":
+                st.warning(f"作废原因：{header['void_reason']}｜操作人：{header['voided_by']}")
+            render_void_form(
+                "结算单", header["id"], header["status"], "void_settlement",
+                void_settlement, user, "settlement",
+            )
 
 elif menu == "应收账款":
     st.subheader("客户应收汇总")
@@ -697,3 +854,102 @@ elif menu == "库存查询":
         st.info("暂无库存数据。")
     else:
         st.dataframe(current_inventory, width="stretch", hide_index=True)
+
+elif menu == "用户与权限":
+    st.subheader("用户与权限")
+    st.caption("角色权限固定分级；新增用户首次登录后必须修改初始密码。")
+    with st.expander("新增用户", expanded=False):
+        with st.form("create_user_form"):
+            c1, c2, c3, c4 = st.columns(4)
+            username = c1.text_input("登录账号")
+            display_name = c2.text_input("姓名")
+            role_label = c3.selectbox("角色", list(ROLE_LABELS.values()))
+            initial_password = c4.text_input("初始密码（至少 8 位）", type="password")
+            if st.form_submit_button("创建用户", type="primary"):
+                try:
+                    role = next(key for key, value in ROLE_LABELS.items() if value == role_label)
+                    create_user(username, display_name, role, initial_password, actor=user)
+                    st.session_state["flash"] = "用户已创建，首次登录必须修改密码"
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    users_df = rows_df(list_users(actor=user))
+    users_display = users_df.assign(
+        role=users_df["role"].map(ROLE_LABELS),
+        is_active=users_df["is_active"].map({1: "启用", 0: "停用"}),
+        must_change_password=users_df["must_change_password"].map({1: "是", 0: "否"}),
+    ).rename(columns={
+        "id": "用户ID", "username": "登录账号", "display_name": "姓名", "role": "角色",
+        "is_active": "状态", "must_change_password": "需修改密码",
+        "last_login_at": "最后登录时间", "created_at": "创建时间", "updated_at": "更新时间",
+    })
+    event = st.dataframe(
+        users_display,
+        key="user_list",
+        on_select="rerun",
+        selection_mode="single-row",
+        width="stretch",
+        hide_index=True,
+        column_config={"用户ID": None},
+    )
+    if event.selection.rows:
+        selected = users_df.iloc[event.selection.rows[0]]
+        st.markdown(f"#### 管理用户：{selected['username']}")
+        c1, c2, c3 = st.columns(3)
+        new_name = c1.text_input("姓名", selected["display_name"], key=f"user_name_{selected['id']}")
+        role_keys = list(ROLE_LABELS)
+        new_role = c2.selectbox(
+            "角色", role_keys, index=role_keys.index(selected["role"]),
+            format_func=lambda value: ROLE_LABELS[value], key=f"user_role_{selected['id']}",
+        )
+        new_active = c3.checkbox(
+            "账号启用", value=bool(selected["is_active"]), key=f"user_active_{selected['id']}"
+        )
+        if st.button("保存用户权限", type="primary", key=f"save_user_{selected['id']}"):
+            try:
+                update_user(selected["id"], new_name, new_role, new_active, actor=user)
+                st.session_state["flash"] = "用户权限已更新"
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        with st.form(f"reset_password_{selected['id']}"):
+            reset_password = st.text_input("重置为新密码（至少 8 位）", type="password")
+            confirm_reset = st.checkbox("确认重置；该用户下次登录必须修改密码")
+            if st.form_submit_button("重置密码"):
+                if not confirm_reset:
+                    st.error("请先勾选确认项")
+                else:
+                    try:
+                        reset_user_password(selected["id"], reset_password, actor=user)
+                        st.success("密码已重置")
+                    except Exception as exc:
+                        st.error(str(exc))
+
+elif menu == "审计日志":
+    st.subheader("完整审计日志")
+    st.caption("记录登录、基础资料、用户权限、单据生效/作废、密码及备份操作。审计记录只读。")
+    logs = rows_df(list_audit_logs(actor=user))
+    if logs.empty:
+        st.info("暂无审计记录。")
+    else:
+        c1, c2, c3 = st.columns(3)
+        user_filter = c1.text_input("按账号筛选")
+        action_options = ["全部"] + sorted(logs["action"].dropna().unique().tolist())
+        action_filter = c2.selectbox("按操作筛选", action_options)
+        entity_options = ["全部"] + sorted(logs["entity_type"].dropna().unique().tolist())
+        entity_filter = c3.selectbox("按业务类型筛选", entity_options)
+        filtered = logs.copy()
+        if user_filter:
+            filtered = filtered[filtered["username"].str.contains(user_filter, case=False, na=False)]
+        if action_filter != "全部":
+            filtered = filtered[filtered["action"] == action_filter]
+        if entity_filter != "全部":
+            filtered = filtered[filtered["entity_type"] == entity_filter]
+        audit_display = filtered.rename(columns={
+            "id": "日志ID", "created_at": "操作时间", "username": "操作账号",
+            "action": "操作", "entity_type": "业务类型", "entity_id": "业务ID",
+            "source_no": "业务单号", "detail": "原因/说明",
+            "before_json": "修改前", "after_json": "修改后",
+        })
+        st.dataframe(audit_display, width="stretch", hide_index=True)
