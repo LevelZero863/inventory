@@ -19,6 +19,7 @@ from auth import (
     update_user,
 )
 from db import DB_PATH, backup_database, init_db, integrity_check
+from pdf_exports import inbound_pdf, outbound_pdf, settlement_pdf
 from permissions import ROLE_LABELS, has_permission
 from services import (
     add_customer,
@@ -134,11 +135,14 @@ OUTBOUND_COLUMNS = {
     "id": "单据ID",
     "order_no": "出库单号",
     "order_date": "出库日期",
-    "customer_name": "客户名称",
+    "outbound_type": "出库类型",
+    "customer_name": "客户/领料人",
+    "warehouse": "仓库",
     "total_amount": "出库总金额",
     "settled_amount": "已结算金额",
     "outstanding": "未收金额",
     "settlement_status": "结算状态",
+    "operator": "经办人",
     "status": "单据状态",
 }
 
@@ -161,6 +165,26 @@ def rows_df(rows):
 
 def inventory_df():
     return rows_df(inventory_rows()).rename(columns=INVENTORY_COLUMNS)
+
+
+def date_filter(prefix: str, label="按日期筛选"):
+    enabled = st.checkbox(label, key=f"{prefix}_date_enabled")
+    if not enabled:
+        return None, None
+    c1, c2 = st.columns(2)
+    start = c1.date_input("开始日期", date.today().replace(day=1), key=f"{prefix}_start")
+    end = c2.date_input("结束日期", date.today(), key=f"{prefix}_end")
+    if start > end:
+        st.error("开始日期不能晚于结束日期")
+        return "9999-12-31", "0001-01-01"
+    return start.isoformat(), end.isoformat()
+
+
+def audit_pdf_export(entity_type, entity_id, source_no):
+    write_audit(
+        "导出PDF", st.session_state.get("auth_user"), entity_type=entity_type,
+        entity_id=int(entity_id), source_no=source_no,
+    )
 
 
 def product_options():
@@ -350,12 +374,27 @@ def outbound_dialog():
     customers = list_customers(active_only=True)
     warehouses = list_warehouses()
     customer_map = {f"{c['code']} - {c['name']}": c["id"] for c in customers}
-    if not product_map or not customer_map or not warehouses:
-        st.warning("请先维护产品、客户和仓库资料。")
+    if not product_map or not warehouses:
+        st.warning("请先维护产品和仓库资料。")
+        return
+    outbound_type = st.radio(
+        "出库类型", ["销售出库", "领料出库"], horizontal=True, key="outbound_type",
+        help="领料出库用于内部领用或非正常销售出库，不产生应收账款。",
+    )
+    if outbound_type == "销售出库" and not customer_map:
+        st.warning("销售出库前请先维护至少一个启用客户。")
         return
     c1, c2, c3, c4 = st.columns(4)
     order_date = c1.date_input("出库日期", date.today(), key="outbound_date")
-    customer_label = c2.selectbox("客户", list(customer_map), key="outbound_customer")
+    if outbound_type == "销售出库":
+        customer_label = c2.selectbox("客户", list(customer_map), key="outbound_customer")
+        customer_id = customer_map[customer_label]
+        material_recipient = ""
+    else:
+        material_recipient = c2.text_input(
+            "领料人/部门（选填）", key="outbound_material_recipient"
+        )
+        customer_id = None
     warehouse = c3.selectbox("仓库", warehouses, key="outbound_warehouse")
     operator = c4.text_input("经办人", current_operator(), key="outbound_operator")
     remark = st.text_input("备注", key="outbound_remark")
@@ -368,8 +407,9 @@ def outbound_dialog():
     if st.button("提交并生效", type="primary", key="submit_outbound"):
         try:
             no = create_outbound(
-                order_date.isoformat(), customer_map[customer_label], warehouse, operator, remark,
+                order_date.isoformat(), customer_id, warehouse, operator, remark,
                 parse_product_items(edited, product_map), actor=st.session_state["auth_user"],
+                outbound_type=outbound_type, material_recipient=material_recipient,
             )
             _clear_lines("outbound_items")
             st.session_state["flash"] = f"出库单 {no} 已提交并生效"
@@ -473,7 +513,7 @@ def detail_items_df(items):
 
 
 st.title("📦 库存管理系统")
-st.caption("AI 安全迭代版 V1.4 · 权限控制 + 单据生命周期 + 完整审计")
+st.caption("AI 安全迭代版 V1.5 · 单据打印/PDF + 多字段筛选 + 领料出库")
 if message := st.session_state.pop("flash", None):
     st.success(message)
 
@@ -650,7 +690,21 @@ elif menu == "入库管理":
     elif not has_permission(user, "create_inbound"):
         st.caption("当前角色可查看入库单，但无权新增或作废。")
     st.subheader("入库单列表")
-    inbound_df = rows_df(inbound_list()).rename(columns=INBOUND_COLUMNS)
+    with st.expander("筛选条件", expanded=False):
+        inbound_start, inbound_end = date_filter("inbound_filter", "按入库日期筛选")
+        f1, f2, f3 = st.columns(3)
+        inbound_warehouse = f1.selectbox(
+            "仓库", ["全部"] + list_warehouses(), key="inbound_filter_warehouse"
+        )
+        inbound_status = f2.selectbox(
+            "单据状态", ["全部", "已生效", "已作废"], key="inbound_filter_status"
+        )
+        inbound_keyword = f3.text_input(
+            "关键词", placeholder="单号、供应商或经办人", key="inbound_filter_keyword"
+        )
+    inbound_df = rows_df(inbound_list(
+        inbound_start, inbound_end, inbound_status, inbound_warehouse, inbound_keyword
+    )).rename(columns=INBOUND_COLUMNS)
     if inbound_df.empty:
         st.info("暂无入库单。")
     else:
@@ -681,6 +735,13 @@ elif menu == "入库管理":
                     "金额": st.column_config.NumberColumn("金额", format="¥ %.2f"),
                 },
             )
+            st.download_button(
+                "下载/打印 PDF", data=inbound_pdf(header, items),
+                file_name=f"{header['order_no']}_入库单.pdf", mime="application/pdf",
+                key=f"inbound_pdf_{header['id']}",
+                on_click=audit_pdf_export,
+                args=("入库单", header["id"], header["order_no"]),
+            )
             if header["status"] == "已作废":
                 st.warning(f"作废原因：{header['void_reason']}｜操作人：{header['voided_by']}")
             render_void_form(
@@ -697,7 +758,25 @@ elif menu == "出库管理":
     elif not has_permission(user, "create_outbound"):
         st.caption("当前角色可查看出库单，但无权新增或作废。")
     st.subheader("出库单列表")
-    outbound_df = rows_df(outbound_list()).rename(columns=OUTBOUND_COLUMNS)
+    with st.expander("筛选条件", expanded=False):
+        outbound_start, outbound_end = date_filter("outbound_filter", "按出库日期筛选")
+        f1, f2, f3, f4 = st.columns(4)
+        outbound_warehouse = f1.selectbox(
+            "仓库", ["全部"] + list_warehouses(), key="outbound_filter_warehouse"
+        )
+        outbound_status = f2.selectbox(
+            "单据状态", ["全部", "已生效", "已作废"], key="outbound_filter_status"
+        )
+        outbound_kind = f3.selectbox(
+            "出库类型", ["全部", "销售出库", "领料出库"], key="outbound_filter_type"
+        )
+        outbound_keyword = f4.text_input(
+            "关键词", placeholder="单号、客户、领料人或经办人", key="outbound_filter_keyword"
+        )
+    outbound_df = rows_df(outbound_list(
+        outbound_start, outbound_end, outbound_status, outbound_warehouse,
+        outbound_kind, outbound_keyword,
+    )).rename(columns=OUTBOUND_COLUMNS)
     if outbound_df.empty:
         st.info("暂无出库单。")
     else:
@@ -719,9 +798,11 @@ elif menu == "出库管理":
             selected = outbound_df.iloc[event.selection.rows[0]]
             header, items = outbound_detail(int(selected["单据ID"]))
             st.subheader(f"{header['order_no']}｜出库明细")
+            party_label = "领料人/部门" if header["outbound_type"] == "领料出库" else "客户"
             st.caption(
-                f"日期：{header['order_date']}　客户：{header['customer_name']}　"
-                f"仓库：{header['warehouse']}　状态：{header['status']}"
+                f"日期：{header['order_date']}　类型：{header['outbound_type']}　"
+                f"{party_label}：{header['customer_name']}　仓库：{header['warehouse']}　"
+                f"状态：{header['status']}"
             )
             st.dataframe(
                 detail_items_df(items), width="stretch", hide_index=True,
@@ -729,6 +810,15 @@ elif menu == "出库管理":
                     "单价": st.column_config.NumberColumn("单价", format="¥ %.2f"),
                     "金额": st.column_config.NumberColumn("金额", format="¥ %.2f"),
                 },
+            )
+            if header["outbound_type"] == "领料出库":
+                st.info("该单为领料出库，不产生应收账款，也不能加入结算单。")
+            st.download_button(
+                "下载/打印 PDF", data=outbound_pdf(header, items),
+                file_name=f"{header['order_no']}_{header['outbound_type']}.pdf",
+                mime="application/pdf", key=f"outbound_pdf_{header['id']}",
+                on_click=audit_pdf_export,
+                args=("出库单", header["id"], header["order_no"]),
             )
             if header["status"] == "已作废":
                 st.warning(f"作废原因：{header['void_reason']}｜操作人：{header['voided_by']}")
@@ -764,7 +854,30 @@ elif menu == "结算管理":
             },
         )
     st.subheader("结算单列表")
-    settlements_df = rows_df(settlement_list()).rename(columns=SETTLEMENT_COLUMNS)
+    with st.expander("筛选条件", expanded=False):
+        settlement_start, settlement_end = date_filter("settlement_filter", "按结算日期筛选")
+        settlement_customers = list_customers()
+        settlement_customer_map = {
+            f"{customer['code']} - {customer['name']}": customer["id"]
+            for customer in settlement_customers
+        }
+        f1, f2, f3 = st.columns(3)
+        settlement_status = f1.selectbox(
+            "单据状态", ["全部", "已生效", "已作废"], key="settlement_filter_status"
+        )
+        settlement_customer = f2.selectbox(
+            "客户", ["全部"] + list(settlement_customer_map), key="settlement_filter_customer"
+        )
+        settlement_keyword = f3.text_input(
+            "关键词", placeholder="单号、客户或经办人", key="settlement_filter_keyword"
+        )
+    settlement_customer_id = (
+        None if settlement_customer == "全部" else settlement_customer_map[settlement_customer]
+    )
+    settlements_df = rows_df(settlement_list(
+        settlement_start, settlement_end, settlement_status,
+        settlement_customer_id, settlement_keyword,
+    )).rename(columns=SETTLEMENT_COLUMNS)
     if settlements_df.empty:
         st.info("暂无结算单。")
     else:
@@ -792,6 +905,13 @@ elif menu == "结算管理":
             st.dataframe(
                 settlement_items, width="stretch", hide_index=True,
                 column_config={"金额": st.column_config.NumberColumn("金额", format="¥ %.2f")},
+            )
+            st.download_button(
+                "下载/打印 PDF", data=settlement_pdf(header, items),
+                file_name=f"{header['settlement_no']}_结算单.pdf", mime="application/pdf",
+                key=f"settlement_pdf_{header['id']}",
+                on_click=audit_pdf_export,
+                args=("结算单", header["id"], header["settlement_no"]),
             )
             if header["status"] == "已作废":
                 st.warning(f"作废原因：{header['void_reason']}｜操作人：{header['voided_by']}")
@@ -848,8 +968,27 @@ elif menu == "应收账款":
             )
 
 elif menu == "库存查询":
-    st.subheader("当前在库产品明细")
-    current_inventory = inventory_df()
+    st.subheader("库存情况")
+    with st.expander("筛选条件", expanded=False):
+        inventory_as_of_enabled = st.checkbox("查询历史时点库存", key="inventory_as_of_enabled")
+        inventory_as_of = (
+            st.date_input("库存截止日期", date.today(), key="inventory_as_of").isoformat()
+            if inventory_as_of_enabled else None
+        )
+        f1, f2, f3 = st.columns(3)
+        inventory_warehouse = f1.selectbox(
+            "仓库", ["全部"] + list_warehouses(), key="inventory_filter_warehouse"
+        )
+        inventory_keyword = f2.text_input(
+            "产品关键词", placeholder="产品编码、名称或规格", key="inventory_filter_keyword"
+        )
+        inventory_nonzero = f3.checkbox("仅显示非零库存", key="inventory_nonzero")
+    if inventory_as_of:
+        st.caption(f"显示截至 {inventory_as_of}（含当日）的历史库存。")
+    current_inventory = rows_df(inventory_rows(
+        as_of_date=inventory_as_of, warehouse=inventory_warehouse,
+        keyword=inventory_keyword, include_zero=not inventory_nonzero,
+    )).rename(columns=INVENTORY_COLUMNS)
     if current_inventory.empty:
         st.info("暂无库存数据。")
     else:

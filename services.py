@@ -9,6 +9,9 @@ from audit import write_audit
 from db import get_conn
 from permissions import require_permission
 
+MATERIAL_CUSTOMER_CODE = "SYS-MATERIAL"
+OUTBOUND_TYPES = {"销售出库", "领料出库"}
+
 
 def _raise_friendly_unique_error(exc: sqlite3.IntegrityError, entity: str) -> None:
     if "unique" in str(exc).lower():
@@ -34,12 +37,18 @@ def list_products(active_only: bool = False):
     return rows
 
 
-def list_customers(active_only: bool = False):
+def list_customers(active_only: bool = False, include_system: bool = False):
     conn = get_conn()
     sql = "SELECT * FROM customers"
+    conditions = []
     if active_only:
-        sql += " WHERE status='启用'"
-    rows = conn.execute(sql + " ORDER BY id DESC").fetchall()
+        conditions.append("status='启用'")
+    if not include_system:
+        conditions.append("code<>?")
+    params = [] if include_system else [MATERIAL_CUSTOMER_CODE]
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    rows = conn.execute(sql + " ORDER BY id DESC", params).fetchall()
     conn.close()
     return rows
 
@@ -185,15 +194,31 @@ def update_customer(customer_id, code, name, contact, phone, address, method, st
         conn.close()
 
 
-def inventory_rows():
+def inventory_rows(as_of_date=None, warehouse=None, keyword=None, include_zero=True):
     conn = get_conn()
-    rows = conn.execute("""
+    txn_date_condition = ""
+    params = []
+    if as_of_date:
+        txn_date_condition = " AND t.txn_date<=?"
+        params.append(str(as_of_date))
+    conditions = []
+    if warehouse and warehouse != "全部":
+        conditions.append("COALESCE(t.warehouse,'暂无库存')=?")
+        params.append(str(warehouse))
+    if keyword:
+        conditions.append("(p.code LIKE ? OR p.name LIKE ? OR p.spec LIKE ?)")
+        pattern = f"%{str(keyword).strip()}%"
+        params.extend([pattern, pattern, pattern])
+    having = "" if include_zero else " HAVING ABS(COALESCE(SUM(t.qty),0))>0.000000001"
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    rows = conn.execute(f"""
         SELECT p.code product_code,p.name product_name,p.spec,p.unit,
                COALESCE(t.warehouse,'暂无库存') warehouse,
                COALESCE(SUM(t.qty),0) current_qty,COALESCE(SUM(t.qty),0) available_qty
-        FROM products p LEFT JOIN inventory_txns t ON t.product_id=p.id
-        GROUP BY p.id,t.warehouse ORDER BY p.code,t.warehouse
-    """).fetchall()
+        FROM products p LEFT JOIN inventory_txns t ON t.product_id=p.id{txn_date_condition}
+        {where}
+        GROUP BY p.id,t.warehouse{having} ORDER BY p.code,t.warehouse
+    """, params).fetchall()
     conn.close(); return rows
 
 
@@ -254,25 +279,52 @@ def create_inbound(order_date, supplier, warehouse, operator, remark, items: Ite
     return no
 
 
-def create_outbound(order_date, customer_id, warehouse, operator, remark, items: Iterable[dict], confirm=None, actor=None):
+def create_outbound(
+    order_date, customer_id, warehouse, operator, remark, items: Iterable[dict],
+    confirm=None, actor=None, outbound_type="销售出库", material_recipient="",
+):
     """Create an outbound order and apply it immediately.
 
     ``confirm`` is retained only for compatibility with V1.0.1 callers. New
     orders no longer have a draft state.
     """
     require_permission(actor, "create_outbound")
+    if outbound_type not in OUTBOUND_TYPES:
+        raise ValueError("出库类型无效")
     items = list(items)
     if not items: raise ValueError("至少需要一条出库明细")
     if any(i["quantity"] <= 0 for i in items): raise ValueError("出库数量必须大于0")
     if any(i["price"] < 0 for i in items): raise ValueError("单价不得小于0")
     _validate_active_products(items)
     conn = get_conn()
-    customer = conn.execute(
-        "SELECT 1 FROM customers WHERE id=? AND status='启用'", (int(customer_id),)
-    ).fetchone()
+    if outbound_type == "销售出库":
+        customer = conn.execute(
+            "SELECT id FROM customers WHERE id=? AND status='启用' AND code<>?",
+            (int(customer_id), MATERIAL_CUSTOMER_CODE),
+        ).fetchone()
+        if not customer:
+            conn.close()
+            raise ValueError("客户不存在或已停用")
+        resolved_customer_id = int(customer_id)
+        material_recipient = ""
+    else:
+        conn.execute(
+            """INSERT OR IGNORE INTO customers(
+                   code,name,contact,phone,address,settlement_method,status,remark
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (MATERIAL_CUSTOMER_CODE, "内部领料（系统）", "", "", "", "现结", "停用",
+             "系统内部客户，请勿修改"),
+        )
+        conn.commit()
+        customer = conn.execute(
+            "SELECT id FROM customers WHERE code=?", (MATERIAL_CUSTOMER_CODE,)
+        ).fetchone()
+        if not customer:
+            conn.close()
+            raise ValueError("领料出库系统资料不存在，请先执行数据库迁移")
+        resolved_customer_id = int(customer["id"])
+        material_recipient = str(material_recipient).strip()
     conn.close()
-    if not customer:
-        raise ValueError("客户不存在或已停用")
     required = defaultdict(float)
     for i in items:
         required[int(i["product_id"])] += float(i["quantity"])
@@ -284,7 +336,14 @@ def create_outbound(order_date, customer_id, warehouse, operator, remark, items:
     conn=get_conn()
     try:
         conn.execute("BEGIN")
-        cur=conn.execute("INSERT INTO outbound_orders(order_no,order_date,customer_id,warehouse,operator,remark,status,total_amount) VALUES(?,?,?,?,?,?,?,?)", (no,order_date,customer_id,warehouse,operator,remark,"已生效",total))
+        cur=conn.execute(
+            """INSERT INTO outbound_orders(
+                   order_no,order_date,customer_id,warehouse,operator,remark,status,total_amount,
+                   outbound_type,material_recipient
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (no,order_date,resolved_customer_id,warehouse,operator,remark,"已生效",total,
+             outbound_type,material_recipient),
+        )
         oid=cur.lastrowid
         for i in items:
             amount=i["quantity"]*i["price"]
@@ -293,7 +352,9 @@ def create_outbound(order_date, customer_id, warehouse, operator, remark, items:
         conn.execute("INSERT INTO operation_logs(action,source_no,operator,detail) VALUES(?,?,?,?)", ("出库生效",no,operator,""))
         write_audit(
             "出库单生效", actor, entity_type="出库单", entity_id=oid, source_no=no,
-            after={"order_no": no, "order_date": order_date, "customer_id": int(customer_id),
+            after={"order_no": no, "order_date": order_date,
+                   "customer_id": resolved_customer_id if outbound_type == "销售出库" else None,
+                   "outbound_type": outbound_type, "material_recipient": material_recipient,
                    "warehouse": warehouse, "operator": operator, "remark": remark,
                    "status": "已生效", "total_amount": total, "items": items},
             conn=conn,
@@ -311,7 +372,8 @@ def open_receivables(customer_id=None):
            o.total_amount-o.settled_amount outstanding,
            CASE WHEN o.settled_amount<=0 THEN '未结算' WHEN o.settled_amount<o.total_amount THEN '部分结算' ELSE '已结算' END settlement_status
            FROM outbound_orders o JOIN customers c ON c.id=o.customer_id
-           WHERE o.status IN ('已确认','已生效') AND o.total_amount-o.settled_amount>0"""
+           WHERE o.outbound_type='销售出库'
+             AND o.status IN ('已确认','已生效') AND o.total_amount-o.settled_amount>0"""
     params=[]
     if customer_id is not None: sql += " AND o.customer_id=?"; params.append(customer_id)
     sql += " ORDER BY o.order_date,o.id"
@@ -329,7 +391,8 @@ def receivable_summary():
                COALESCE(SUM(o.total_amount-o.settled_amount),0) outstanding
         FROM outbound_orders o
         JOIN customers c ON c.id=o.customer_id
-        WHERE o.status IN ('已确认','已生效')
+        WHERE o.outbound_type='销售出库'
+          AND o.status IN ('已确认','已生效')
           AND o.total_amount-o.settled_amount>0
         GROUP BY c.id,c.code,c.name
         ORDER BY outstanding DESC,c.id
@@ -347,8 +410,12 @@ def settle(customer_id, settlement_date, method, operator, remark, allocations: 
         conn.execute("BEGIN")
         total=0
         for oid, amount in allocations.items():
-            row=conn.execute("SELECT customer_id,total_amount,settled_amount,status FROM outbound_orders WHERE id=?",(oid,)).fetchone()
+            row=conn.execute(
+                "SELECT customer_id,total_amount,settled_amount,status,outbound_type FROM outbound_orders WHERE id=?",
+                (oid,),
+            ).fetchone()
             if not row: raise ValueError("出库单不存在")
+            if row[4] != "销售出库": raise ValueError("领料出库不参与应收结算")
             if row[0] != customer_id: raise ValueError("只能结算当前客户的出库单")
             if row[3] not in {"已确认", "已生效"}:
                 raise ValueError("只能结算已生效的出库单")
@@ -560,7 +627,10 @@ def outbound_detail(order_id: int):
     conn = get_conn()
     try:
         header = conn.execute(
-            """SELECT o.*,c.code customer_code,c.name customer_name
+            """SELECT o.*,c.code customer_code,
+                      CASE WHEN o.outbound_type='领料出库'
+                           THEN COALESCE(NULLIF(o.material_recipient,''),'未填写')
+                           ELSE c.name END customer_name
                FROM outbound_orders o JOIN customers c ON c.id=o.customer_id WHERE o.id=?""",
             (int(order_id),),
         ).fetchone()
@@ -606,31 +676,111 @@ def dashboard():
         "outbound_today_amount": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE order_date=? AND status IN ('已确认','已生效')",(today,)).fetchone()[0],
         "inventory_total": conn.execute("SELECT COALESCE(SUM(qty),0) FROM inventory_txns").fetchone()[0],
         "product_types": conn.execute("SELECT COUNT(*) FROM products WHERE status='启用'").fetchone()[0],
-        "receivable": conn.execute("SELECT COALESCE(SUM(total_amount-settled_amount),0) FROM outbound_orders WHERE status IN ('已确认','已生效')").fetchone()[0],
-        "month_new_ar": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE status IN ('已确认','已生效') AND substr(order_date,1,7)=?",(month,)).fetchone()[0],
+        "receivable": conn.execute("SELECT COALESCE(SUM(total_amount-settled_amount),0) FROM outbound_orders WHERE outbound_type='销售出库' AND status IN ('已确认','已生效')").fetchone()[0],
+        "month_new_ar": conn.execute("SELECT COALESCE(SUM(total_amount),0) FROM outbound_orders WHERE outbound_type='销售出库' AND status IN ('已确认','已生效') AND substr(order_date,1,7)=?",(month,)).fetchone()[0],
         "month_settled": conn.execute("SELECT COALESCE(SUM(amount),0) FROM settlements WHERE status='已生效' AND substr(settlement_date,1,7)=?",(month,)).fetchone()[0],
     }
     conn.close(); return vals
 
 
-def outbound_list():
-    conn=get_conn(); rows=conn.execute("""SELECT o.id,o.order_no,o.order_date,c.name customer_name,o.total_amount,o.settled_amount,
-    o.total_amount-o.settled_amount outstanding,CASE WHEN o.settled_amount<=0 THEN '未结算' WHEN o.settled_amount<o.total_amount THEN '部分结算' ELSE '已结算' END settlement_status,o.status
-    FROM outbound_orders o JOIN customers c ON c.id=o.customer_id ORDER BY o.id DESC""").fetchall(); conn.close(); return rows
-
-
-def inbound_list():
-    conn=get_conn(); rows=conn.execute("SELECT id,order_no,order_date,supplier,warehouse,total_amount,operator,status FROM inbound_orders ORDER BY id DESC").fetchall(); conn.close(); return rows
-
-
-def settlement_list():
+def inbound_list(start_date=None, end_date=None, status=None, warehouse=None, keyword=None):
+    conditions, params = [], []
+    if start_date:
+        conditions.append("i.order_date>=?"); params.append(str(start_date))
+    if end_date:
+        conditions.append("i.order_date<=?"); params.append(str(end_date))
+    if status and status != "全部":
+        if status == "已生效":
+            conditions.append("i.status IN ('已确认','已生效')")
+        else:
+            conditions.append("i.status=?"); params.append(str(status))
+    if warehouse and warehouse != "全部":
+        conditions.append("i.warehouse=?"); params.append(str(warehouse))
+    if keyword:
+        pattern = f"%{str(keyword).strip()}%"
+        conditions.append("(i.order_no LIKE ? OR i.supplier LIKE ? OR i.operator LIKE ?)")
+        params.extend([pattern, pattern, pattern])
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
     conn = get_conn()
-    rows = conn.execute("""
-        SELECT s.id,s.settlement_no,s.settlement_date,c.name customer_name,s.method,
-               s.amount,s.operator,s.status,s.remark
-        FROM settlements s
-        JOIN customers c ON c.id=s.customer_id
-        ORDER BY s.id DESC
-    """).fetchall()
+    rows = conn.execute(
+        """SELECT i.id,i.order_no,i.order_date,i.supplier,i.warehouse,
+                  i.total_amount,i.operator,i.status
+           FROM inbound_orders i""" + where + " ORDER BY i.id DESC",
+        params,
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def outbound_list(
+    start_date=None, end_date=None, status=None, warehouse=None,
+    outbound_type=None, keyword=None,
+):
+    conditions, params = [], []
+    if start_date:
+        conditions.append("o.order_date>=?"); params.append(str(start_date))
+    if end_date:
+        conditions.append("o.order_date<=?"); params.append(str(end_date))
+    if status and status != "全部":
+        if status == "已生效":
+            conditions.append("o.status IN ('已确认','已生效')")
+        else:
+            conditions.append("o.status=?"); params.append(str(status))
+    if warehouse and warehouse != "全部":
+        conditions.append("o.warehouse=?"); params.append(str(warehouse))
+    if outbound_type and outbound_type != "全部":
+        conditions.append("o.outbound_type=?"); params.append(str(outbound_type))
+    if keyword:
+        pattern = f"%{str(keyword).strip()}%"
+        conditions.append(
+            "(o.order_no LIKE ? OR c.name LIKE ? OR o.material_recipient LIKE ? OR o.operator LIKE ?)"
+        )
+        params.extend([pattern, pattern, pattern, pattern])
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT o.id,o.order_no,o.order_date,o.outbound_type,
+                  CASE WHEN o.outbound_type='领料出库'
+                       THEN COALESCE(NULLIF(o.material_recipient,''),'未填写')
+                       ELSE c.name END customer_name,
+                  o.warehouse,o.total_amount,o.settled_amount,
+                  CASE WHEN o.outbound_type='领料出库' THEN 0
+                       ELSE o.total_amount-o.settled_amount END outstanding,
+                  CASE WHEN o.outbound_type='领料出库' THEN '不参与结算'
+                       WHEN o.settled_amount<=0 THEN '未结算'
+                       WHEN o.settled_amount<o.total_amount THEN '部分结算'
+                       ELSE '已结算' END settlement_status,
+                  o.operator,o.status
+           FROM outbound_orders o JOIN customers c ON c.id=o.customer_id""" + where +
+        " ORDER BY o.id DESC",
+        params,
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def settlement_list(start_date=None, end_date=None, status=None, customer_id=None, keyword=None):
+    conditions, params = [], []
+    if start_date:
+        conditions.append("s.settlement_date>=?"); params.append(str(start_date))
+    if end_date:
+        conditions.append("s.settlement_date<=?"); params.append(str(end_date))
+    if status and status != "全部":
+        conditions.append("s.status=?"); params.append(str(status))
+    if customer_id:
+        conditions.append("s.customer_id=?"); params.append(int(customer_id))
+    if keyword:
+        pattern = f"%{str(keyword).strip()}%"
+        conditions.append("(s.settlement_no LIKE ? OR c.name LIKE ? OR s.operator LIKE ?)")
+        params.extend([pattern, pattern, pattern])
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT s.id,s.settlement_no,s.settlement_date,c.name customer_name,s.method,
+                  s.amount,s.operator,s.status,s.remark
+           FROM settlements s JOIN customers c ON c.id=s.customer_id""" + where +
+        " ORDER BY s.id DESC",
+        params,
+    ).fetchall()
     conn.close()
     return rows

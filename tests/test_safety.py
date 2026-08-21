@@ -13,13 +13,17 @@ class SafetyTests(unittest.TestCase):
     def test_migration_and_integrity(self):
         self.assertEqual(db.integrity_check(), "ok")
         conn=db.get_conn()
-        self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0],3)
+        self.assertEqual(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0],4)
         self.assertTrue(conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_logs'"
         ).fetchone())
         self.assertIn(
             "void_reason",
             {row[1] for row in conn.execute("PRAGMA table_info(inbound_orders)")},
+        )
+        self.assertIn(
+            "outbound_type",
+            {row[1] for row in conn.execute("PRAGMA table_info(outbound_orders)")},
         )
         conn.close()
     def test_backup_preserves_data(self):

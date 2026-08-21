@@ -2,3 +2,4 @@ streamlit==1.49.1
 pandas==2.2.3
 numpy==1.26.4
 pyarrow==17.0.0
+reportlab==4.2.5
