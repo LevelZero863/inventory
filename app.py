@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -19,11 +20,21 @@ from auth import (
     update_user,
 )
 from db import DB_PATH, backup_database, init_db, integrity_check
+from excel_imports import (
+    import_customers,
+    import_inbound_orders,
+    import_inventory,
+    import_outbound_orders,
+    import_products,
+    import_settlement_orders,
+    import_warehouses,
+)
 from pdf_exports import inbound_pdf, outbound_pdf, settlement_pdf
 from permissions import ROLE_LABELS, has_permission
 from services import (
     add_customer,
     add_product,
+    add_warehouse,
     create_inbound,
     create_outbound,
     dashboard,
@@ -33,6 +44,7 @@ from services import (
     list_customers,
     list_products,
     list_warehouses,
+    list_warehouse_records,
     open_receivables,
     outbound_detail,
     outbound_list,
@@ -42,14 +54,74 @@ from services import (
     settlement_list,
     update_customer,
     update_product,
+    update_warehouse,
     void_inbound,
     void_outbound,
     void_settlement,
 )
 
 st.set_page_config(page_title="库存管理系统", page_icon="📦", layout="wide")
+
+st.markdown("""
+<style>
+    :root {
+        --brand-navy: #102A4C;
+        --brand-blue: #2563EB;
+        --brand-cyan: #0EA5E9;
+        --surface: #FFFFFF;
+        --canvas: #F4F7FB;
+        --line: #E2E8F0;
+        --text: #172033;
+        --muted: #64748B;
+    }
+    .stApp { background: var(--canvas); color: var(--text); }
+    [data-testid="stHeader"] { background: rgba(244,247,251,.88); backdrop-filter: blur(10px); }
+    [data-testid="stSidebar"] { background: linear-gradient(180deg, #102A4C 0%, #173B67 100%); }
+    [data-testid="stSidebar"] * { color: #EAF2FF; }
+    [data-testid="stSidebar"] [role="radiogroup"] label {
+        padding: .55rem .75rem; border-radius: 9px; margin: .12rem 0;
+    }
+    [data-testid="stSidebar"] [role="radiogroup"] label:hover { background: rgba(255,255,255,.09); }
+    [data-testid="stSidebar"] [aria-checked="true"] { background: rgba(59,130,246,.28); }
+    [data-testid="stMetric"] {
+        background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+        padding: 1rem 1.15rem; box-shadow: 0 4px 16px rgba(15,42,76,.05);
+    }
+    [data-testid="stMetricLabel"] { color: var(--muted); font-weight: 600; }
+    [data-testid="stMetricValue"] { color: var(--brand-navy); }
+    .stButton > button, .stDownloadButton > button {
+        border-radius: 9px; border-color: #CBD5E1; font-weight: 600;
+    }
+    .stButton > button[kind="primary"] { background: var(--brand-blue); border-color: var(--brand-blue); }
+    [data-testid="stExpander"] {
+        background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+        box-shadow: 0 2px 10px rgba(15,42,76,.035);
+    }
+    [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
+        background: var(--surface); border-radius: 12px; overflow: hidden;
+        box-shadow: 0 2px 12px rgba(15,42,76,.04);
+    }
+    [data-baseweb="tab-list"] { gap: .5rem; }
+    [data-baseweb="tab"] { border-radius: 9px 9px 0 0; padding: .7rem 1rem; font-weight: 600; }
+    h1, h2, h3 { color: var(--brand-navy); letter-spacing: -.02em; }
+    .business-header {
+        background: linear-gradient(120deg, #102A4C, #1D4E89); color: white;
+        padding: 1.25rem 1.45rem; border-radius: 16px; margin-bottom: 1.1rem;
+        box-shadow: 0 10px 28px rgba(15,42,76,.14);
+    }
+    .business-header h2 { color: white; margin: 0 0 .25rem; font-size: 1.55rem; }
+    .business-header p { color: #CFE3FF; margin: 0; }
+    .section-kicker { color: #2563EB; font-size: .78rem; font-weight: 800; letter-spacing: .08em; }
+    .import-note {
+        padding: .7rem .85rem; border-left: 4px solid #2563EB; background: #EFF6FF;
+        border-radius: 7px; color: #334155; margin: .4rem 0 .8rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 init_db()
 initial_admin_created = ensure_initial_admin()
+TEMPLATE_PATH = Path(__file__).resolve().parent / "assets" / "templates" / "库存系统批量导入模板.xlsx"
 
 
 def render_login():
@@ -163,6 +235,75 @@ def rows_df(rows):
     return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
 
 
+def page_header(title, subtitle, icon="▦"):
+    st.markdown(
+        f"""<div class="business-header"><h2>{icon}　{title}</h2><p>{subtitle}</p></div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_excel_import(sheet_name, importer, key, permission, actor):
+    if not has_permission(actor, permission):
+        return
+    with st.expander(f"📥 Excel 批量导入 · {sheet_name}", expanded=False):
+        st.markdown(
+            "<div class='import-note'>先下载统一模板，保留工作表名称和表头。上传后系统会先展示数据预览，点击确认才会写入数据库。</div>",
+            unsafe_allow_html=True,
+        )
+        if TEMPLATE_PATH.exists():
+            st.download_button(
+                "下载 Excel 导入模板", TEMPLATE_PATH.read_bytes(),
+                file_name="库存系统批量导入模板.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_template_{key}",
+            )
+        uploaded = st.file_uploader(
+            f"上传包含“{sheet_name}”工作表的 Excel",
+            type=["xlsx", "xls"], key=f"excel_upload_{key}",
+        )
+        if uploaded is None:
+            return
+        if getattr(uploaded, "size", 0) > 10 * 1024 * 1024:
+            st.error("单个 Excel 文件不得超过 10 MB。")
+            return
+        try:
+            frame = pd.read_excel(uploaded, sheet_name=sheet_name, dtype=object)
+            frame = frame.dropna(how="all")
+        except ValueError:
+            st.error(f"文件中未找到“{sheet_name}”工作表，请使用系统模板。")
+            return
+        except Exception as exc:
+            st.error(f"Excel 读取失败：{exc}")
+            return
+        if frame.empty:
+            st.warning("该工作表没有可导入的数据。")
+            return
+        if len(frame) > 5000:
+            st.error("单次最多导入 5000 行，请拆分文件后重试。")
+            return
+        st.caption(f"检测到 {len(frame)} 行数据。下方最多预览前 50 行。")
+        st.dataframe(frame.head(50), width="stretch", hide_index=True)
+        confirmed = st.checkbox(
+            "我已核对预览数据，并确认执行批量导入",
+            key=f"excel_confirm_{key}",
+        )
+        if st.button(
+            f"确认导入 {sheet_name}", type="primary", disabled=not confirmed,
+            key=f"excel_submit_{key}",
+        ):
+            try:
+                clean = frame.where(pd.notna(frame), None)
+                result = importer(clean.to_dict(orient="records"), actor=actor)
+                details = "；".join(
+                    f"{name}：{', '.join(map(str, value)) if isinstance(value, list) else value}"
+                    for name, value in result.items()
+                )
+                st.session_state["flash"] = f"{sheet_name} Excel 导入成功｜{details}"
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+
 def inventory_df():
     return rows_df(inventory_rows()).rename(columns=INVENTORY_COLUMNS)
 
@@ -222,6 +363,17 @@ def customer_master_df():
             "备注": customer["remark"] or "",
         }
         for customer in list_customers()
+    ])
+
+
+def warehouse_master_df():
+    return pd.DataFrame([
+        {
+            "仓库ID": warehouse["id"], "仓库编码": warehouse["code"],
+            "仓库名称": warehouse["name"], "状态": warehouse["status"],
+            "备注": warehouse["remark"] or "",
+        }
+        for warehouse in list_warehouse_records()
     ])
 
 
@@ -512,14 +664,22 @@ def detail_items_df(items):
     })
 
 
-st.title("📦 库存管理系统")
-st.caption("AI 安全迭代版 V1.5 · 单据打印/PDF + 多字段筛选 + 领料出库")
+st.markdown("<div class='section-kicker'>INVENTORY OPERATIONS</div>", unsafe_allow_html=True)
+st.title("库存经营管理平台")
+st.caption("V1.6 · 批量导入 + 多仓基础资料 + 现代业务工作台")
 if message := st.session_state.pop("flash", None):
     st.success(message)
 
 user = st.session_state["auth_user"]
 st.sidebar.write(f"👤 {user['display_name'] or user['username']}")
 st.sidebar.caption(f"角色：{ROLE_LABELS.get(user['role'], user['role'])}")
+if TEMPLATE_PATH.exists():
+    st.sidebar.download_button(
+        "⬇ 下载 Excel 导入模板", TEMPLATE_PATH.read_bytes(),
+        file_name="库存系统批量导入模板.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        width="stretch", key="sidebar_excel_template",
+    )
 if st.sidebar.button("退出登录", width="stretch"):
     write_audit("退出登录", user, entity_type="用户", entity_id=user["id"], source_no=user["username"])
     st.session_state.pop("auth_user", None)
@@ -544,9 +704,15 @@ if has_permission(user, "manage_users"):
     menu_options.append("用户与权限")
 if has_permission(user, "view_audit"):
     menu_options.append("审计日志")
-menu = st.sidebar.radio("功能菜单", menu_options)
+MENU_ICONS = {
+    "首页": "▦ 经营总览", "基础资料": "◫ 基础资料", "入库管理": "↘ 入库管理",
+    "出库管理": "↗ 出库管理", "结算管理": "✓ 结算管理", "应收账款": "¥ 应收账款",
+    "库存查询": "▤ 库存查询", "用户与权限": "♙ 用户与权限", "审计日志": "☷ 审计日志",
+}
+menu = st.sidebar.radio("功能菜单", menu_options, format_func=lambda value: MENU_ICONS[value])
 
 if menu == "首页":
+    page_header("经营总览", "聚合今日作业、库存规模与应收变化，快速掌握业务状态。", "▦")
     data = dashboard()
     cols = st.columns(4)
     cols[0].metric("今日入库单", data["inbound_today"])
@@ -567,8 +733,10 @@ if menu == "首页":
         st.dataframe(home_inventory, width="stretch", hide_index=True)
 
 elif menu == "基础资料":
-    tab1, tab2 = st.tabs(["产品管理", "客户管理"])
+    page_header("基础资料", "统一维护产品、客户和仓库，为业务单据提供标准主数据。", "◫")
+    tab1, tab2, tab3 = st.tabs(["产品管理", "客户管理", "仓库管理"])
     with tab1:
+        render_excel_import("产品", import_products, "products", "manage_master", user)
         with st.expander("新增产品", expanded=False):
             with st.form("product"):
                 c1, c2, c3, c4 = st.columns(4)
@@ -623,6 +791,7 @@ elif menu == "基础资料":
             except Exception as exc:
                 st.error(str(exc))
     with tab2:
+        render_excel_import("客户", import_customers, "customers", "manage_master", user)
         with st.expander("新增客户", expanded=False):
             with st.form("customer"):
                 c1, c2, c3, c4 = st.columns(4)
@@ -681,7 +850,52 @@ elif menu == "基础资料":
             except Exception as exc:
                 st.error(str(exc))
 
+    with tab3:
+        render_excel_import("仓库", import_warehouses, "warehouses", "manage_master", user)
+        with st.expander("新增仓库", expanded=False):
+            with st.form("warehouse"):
+                c1, c2, c3 = st.columns([1, 2, 1])
+                warehouse_code = c1.text_input("仓库编码")
+                warehouse_name = c2.text_input("仓库名称")
+                warehouse_status = c3.selectbox("状态", ["启用", "停用"], key="new_warehouse_status")
+                warehouse_remark = st.text_input("备注", key="new_warehouse_remark")
+                if st.form_submit_button("保存仓库", type="primary"):
+                    try:
+                        add_warehouse(
+                            warehouse_code, warehouse_name, warehouse_status,
+                            warehouse_remark, actor=user,
+                        )
+                        st.session_state["flash"] = "仓库资料已新增"
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+        st.subheader("仓库列表")
+        st.caption("停用仓库不会出现在新建单据和 Excel 业务导入的可用仓库中，历史数据仍保留。")
+        warehouses_edited = st.data_editor(
+            warehouse_master_df(), key="warehouse_master_editor", hide_index=True,
+            num_rows="fixed", width="stretch",
+            column_config={
+                "仓库ID": None,
+                "仓库编码": st.column_config.TextColumn("仓库编码", required=True),
+                "仓库名称": st.column_config.TextColumn("仓库名称", required=True),
+                "状态": st.column_config.SelectboxColumn("状态", options=["启用", "停用"], required=True),
+                "备注": st.column_config.TextColumn("备注"),
+            },
+        )
+        if st.button("保存仓库修改", type="primary"):
+            try:
+                for _, warehouse in warehouses_edited.iterrows():
+                    update_warehouse(
+                        warehouse["仓库ID"], warehouse["仓库编码"], warehouse["仓库名称"],
+                        warehouse["状态"], warehouse["备注"], actor=user,
+                    )
+                st.session_state["flash"] = "仓库资料已更新"
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
 elif menu == "入库管理":
+    page_header("入库管理", "登记采购及其他入库业务，提交后即时增加对应仓库库存。", "↘")
     c1, _ = st.columns([1, 5])
     if has_permission(user, "create_inbound") and c1.button(
         "＋ 新增入库单", type="primary", width="stretch"
@@ -689,12 +903,13 @@ elif menu == "入库管理":
         inbound_dialog()
     elif not has_permission(user, "create_inbound"):
         st.caption("当前角色可查看入库单，但无权新增或作废。")
+    render_excel_import("入库单", import_inbound_orders, "inbound_orders", "create_inbound", user)
     st.subheader("入库单列表")
     with st.expander("筛选条件", expanded=False):
         inbound_start, inbound_end = date_filter("inbound_filter", "按入库日期筛选")
         f1, f2, f3 = st.columns(3)
         inbound_warehouse = f1.selectbox(
-            "仓库", ["全部"] + list_warehouses(), key="inbound_filter_warehouse"
+            "仓库", ["全部"] + list_warehouses(active_only=False), key="inbound_filter_warehouse"
         )
         inbound_status = f2.selectbox(
             "单据状态", ["全部", "已生效", "已作废"], key="inbound_filter_status"
@@ -750,6 +965,7 @@ elif menu == "入库管理":
             )
 
 elif menu == "出库管理":
+    page_header("出库管理", "统一处理销售出库与内部领料，实时校验可用库存。", "↗")
     c1, _ = st.columns([1, 5])
     if has_permission(user, "create_outbound") and c1.button(
         "＋ 新增出库单", type="primary", width="stretch"
@@ -757,12 +973,13 @@ elif menu == "出库管理":
         outbound_dialog()
     elif not has_permission(user, "create_outbound"):
         st.caption("当前角色可查看出库单，但无权新增或作废。")
+    render_excel_import("出库单", import_outbound_orders, "outbound_orders", "create_outbound", user)
     st.subheader("出库单列表")
     with st.expander("筛选条件", expanded=False):
         outbound_start, outbound_end = date_filter("outbound_filter", "按出库日期筛选")
         f1, f2, f3, f4 = st.columns(4)
         outbound_warehouse = f1.selectbox(
-            "仓库", ["全部"] + list_warehouses(), key="outbound_filter_warehouse"
+            "仓库", ["全部"] + list_warehouses(active_only=False), key="outbound_filter_warehouse"
         )
         outbound_status = f2.selectbox(
             "单据状态", ["全部", "已生效", "已作废"], key="outbound_filter_status"
@@ -828,6 +1045,7 @@ elif menu == "出库管理":
             )
 
 elif menu == "结算管理":
+    page_header("结算管理", "按客户核销销售出库应收，支持多单合并及部分结算。", "✓")
     c1, _ = st.columns([1, 5])
     if has_permission(user, "create_settlement") and c1.button(
         "＋ 新增结算单", type="primary", width="stretch"
@@ -835,6 +1053,7 @@ elif menu == "结算管理":
         settlement_dialog()
     elif not has_permission(user, "create_settlement"):
         st.caption("当前角色可查看结算数据，但无权新增或作废结算单。")
+    render_excel_import("结算单", import_settlement_orders, "settlement_orders", "create_settlement", user)
     st.subheader("待结算客户")
     summary = rows_df(receivable_summary())
     if summary.empty:
@@ -921,6 +1140,7 @@ elif menu == "结算管理":
             )
 
 elif menu == "应收账款":
+    page_header("应收账款", "按客户汇总销售出库未收金额，并下钻查看单据明细。", "¥")
     st.subheader("客户应收汇总")
     summary = rows_df(receivable_summary())
     if summary.empty:
@@ -968,6 +1188,8 @@ elif menu == "应收账款":
             )
 
 elif menu == "库存查询":
+    page_header("库存查询", "查看当前或历史时点库存，并通过 Excel 盘点目标数量生成调整流水。", "▤")
+    render_excel_import("库存", import_inventory, "inventory", "import_inventory", user)
     st.subheader("库存情况")
     with st.expander("筛选条件", expanded=False):
         inventory_as_of_enabled = st.checkbox("查询历史时点库存", key="inventory_as_of_enabled")
@@ -977,7 +1199,7 @@ elif menu == "库存查询":
         )
         f1, f2, f3 = st.columns(3)
         inventory_warehouse = f1.selectbox(
-            "仓库", ["全部"] + list_warehouses(), key="inventory_filter_warehouse"
+            "仓库", ["全部"] + list_warehouses(active_only=False), key="inventory_filter_warehouse"
         )
         inventory_keyword = f2.text_input(
             "产品关键词", placeholder="产品编码、名称或规格", key="inventory_filter_keyword"
@@ -995,6 +1217,7 @@ elif menu == "库存查询":
         st.dataframe(current_inventory, width="stretch", hide_index=True)
 
 elif menu == "用户与权限":
+    page_header("用户与权限", "按岗位分配业务权限，控制主数据、仓储、财务和审计操作。", "♙")
     st.subheader("用户与权限")
     st.caption("角色权限固定分级；新增用户首次登录后必须修改初始密码。")
     with st.expander("新增用户", expanded=False):
@@ -1066,6 +1289,7 @@ elif menu == "用户与权限":
                         st.error(str(exc))
 
 elif menu == "审计日志":
+    page_header("审计日志", "追踪登录、资料变更、Excel 导入和单据全生命周期操作。", "☷")
     st.subheader("完整审计日志")
     st.caption("记录登录、基础资料、用户权限、单据生效/作废、密码及备份操作。审计记录只读。")
     logs = rows_df(list_audit_logs(actor=user))

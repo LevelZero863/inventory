@@ -14,6 +14,7 @@ ALL_PERMISSIONS = {
     "create_inbound",
     "create_outbound",
     "create_settlement",
+    "import_inventory",
     "void_inbound",
     "void_outbound",
     "void_settlement",
@@ -24,7 +25,7 @@ ALL_PERMISSIONS = {
 
 ROLE_PERMISSIONS = {
     "admin": ALL_PERMISSIONS,
-    "warehouse": {"view", "create_inbound", "create_outbound"},
+    "warehouse": {"view", "create_inbound", "create_outbound", "import_inventory"},
     "finance": {"view", "create_settlement", "void_settlement"},
     "viewer": {"view"},
 }

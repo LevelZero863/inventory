@@ -6,6 +6,9 @@
 
 - 首页经营看板
 - 产品、客户基础资料新增与编辑，支持启用/停用
+- 仓库基础资料新增与编辑，支持编码、启用/停用及历史业务保护
+- 产品、客户、仓库、入库单、出库单、结算单和库存支持 Excel 批量导入
+- 提供统一 Excel 模板、上传预览、字段校验、权限控制和导入审计
 - 入库单：弹窗录入、多行明细、自动带出产品默认单价，提交后立即增加库存
 - 出库单：弹窗录入、多行明细、库存校验、自动带出产品默认单价和汇总金额，支持销售出库与领料出库
 - 结算管理：弹窗录入，按客户选择未结算出库单，支持部分结算
@@ -19,6 +22,7 @@
 - 管理员、仓库人员、财务人员、只读人员四级角色权限
 - 已生效单据通过作废和反向业务记录纠错，不删除历史单据
 - 登录、用户权限、基础资料、单据和备份操作的完整审计日志
+- 深色业务导航、浅色工作区、经营指标卡和统一页面标题的现代化界面
 - SQLite 本地数据库，首次运行自动初始化并生成演示数据
 
 业务规则与《库存管理系统开发需求说明书》保持一致：库存由已生效的入库/出库业务形成；应收仅由已生效的销售出库形成，等于销售出库金额减已结算金额；领料出库只影响库存；结算支持部分结算。
@@ -68,6 +72,7 @@ inventory_demo/
 ├── db.py
 ├── permissions.py
 ├── pdf_exports.py
+├── excel_imports.py
 ├── services.py
 ├── requirements.txt
 ├── README.md
@@ -76,8 +81,11 @@ inventory_demo/
 │   └── config.toml
 ├── assets/fonts/
 │   └── NotoSansSC-Regular.ttf
+├── assets/templates/
+│   └── 库存系统批量导入模板.xlsx
 ├── database/migrations/
-│   └── 004_material_issue_and_filters.sql
+│   ├── 004_material_issue_and_filters.sql
+│   └── 005_warehouse_master.sql
 ├── data/
 │   └── .gitkeep
 └── tests/

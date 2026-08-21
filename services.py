@@ -53,8 +53,85 @@ def list_customers(active_only: bool = False, include_system: bool = False):
     return rows
 
 
-def list_warehouses():
-    conn = get_conn(); rows = conn.execute("SELECT name FROM warehouses ORDER BY id").fetchall(); conn.close(); return [r[0] for r in rows]
+def list_warehouse_records(active_only: bool = False):
+    conn = get_conn()
+    sql = "SELECT id,code,name,status,remark FROM warehouses"
+    params = []
+    if active_only:
+        sql += " WHERE status='启用'"
+    rows = conn.execute(sql + " ORDER BY id", params).fetchall()
+    conn.close()
+    return rows
+
+
+def list_warehouses(active_only: bool = True):
+    return [row["name"] for row in list_warehouse_records(active_only=active_only)]
+
+
+def add_warehouse(code, name, status="启用", remark="", actor=None):
+    require_permission(actor, "manage_master")
+    code, name = str(code).strip(), str(name).strip()
+    if not code or not name:
+        raise ValueError("仓库编码和仓库名称不能为空")
+    if status not in {"启用", "停用"}:
+        raise ValueError("仓库状态无效")
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            "INSERT INTO warehouses(code,name,status,remark) VALUES(?,?,?,?)",
+            (code, name, status, str(remark).strip()),
+        )
+        warehouse_id = int(cur.lastrowid)
+        write_audit(
+            "新增仓库", actor, entity_type="仓库", entity_id=warehouse_id, source_no=code,
+            after={"code": code, "name": name, "status": status, "remark": str(remark).strip()},
+            conn=conn,
+        )
+        conn.commit()
+        return warehouse_id
+    except sqlite3.IntegrityError as exc:
+        if "code" in str(exc).lower():
+            raise ValueError("仓库编码已存在") from exc
+        raise ValueError("仓库名称已存在") from exc
+    finally:
+        conn.close()
+
+
+def update_warehouse(warehouse_id, code, name, status="启用", remark="", actor=None):
+    require_permission(actor, "manage_master")
+    code, name = str(code).strip(), str(name).strip()
+    if not code or not name:
+        raise ValueError("仓库编码和仓库名称不能为空")
+    if status not in {"启用", "停用"}:
+        raise ValueError("仓库状态无效")
+    conn = get_conn()
+    try:
+        before = conn.execute("SELECT * FROM warehouses WHERE id=?", (int(warehouse_id),)).fetchone()
+        if not before:
+            raise ValueError("仓库不存在")
+        if before["name"] != name:
+            used = any(conn.execute(
+                f"SELECT 1 FROM {table} WHERE warehouse=? LIMIT 1", (before["name"],)
+            ).fetchone() for table in ("inventory_txns", "inbound_orders", "outbound_orders"))
+            if used:
+                raise ValueError("该仓库已有业务数据，不能修改名称；可停用后新建仓库")
+        conn.execute(
+            "UPDATE warehouses SET code=?,name=?,status=?,remark=? WHERE id=?",
+            (code, name, status, str(remark).strip(), int(warehouse_id)),
+        )
+        after = conn.execute("SELECT * FROM warehouses WHERE id=?", (int(warehouse_id),)).fetchone()
+        if dict(before) != dict(after):
+            write_audit(
+                "修改仓库", actor, entity_type="仓库", entity_id=int(warehouse_id), source_no=code,
+                before=before, after=after, conn=conn,
+            )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        if "code" in str(exc).lower():
+            raise ValueError("仓库编码已存在") from exc
+        raise ValueError("仓库名称已存在") from exc
+    finally:
+        conn.close()
 
 
 def add_product(code, name, spec, unit, price, status="启用", remark="", actor=None):
@@ -241,6 +318,16 @@ def _validate_active_products(items: list[dict]) -> None:
         raise ValueError(f"产品ID {missing[0]} 不存在或已停用")
 
 
+def _validate_active_warehouse(warehouse: str) -> None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM warehouses WHERE name=? AND status='启用'", (str(warehouse).strip(),)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise ValueError("仓库不存在或已停用")
+
+
 def create_inbound(order_date, supplier, warehouse, operator, remark, items: Iterable[dict], confirm=None, actor=None):
     """Create an inbound order and apply it immediately.
 
@@ -253,6 +340,7 @@ def create_inbound(order_date, supplier, warehouse, operator, remark, items: Ite
     if any(i["quantity"] <= 0 for i in items): raise ValueError("入库数量必须大于0")
     if any(i["price"] < 0 for i in items): raise ValueError("单价不得小于0")
     _validate_active_products(items)
+    _validate_active_warehouse(warehouse)
     total = sum(i["quantity"] * i["price"] for i in items)
     no = next_no("RK")
     conn = get_conn()
@@ -296,6 +384,7 @@ def create_outbound(
     if any(i["quantity"] <= 0 for i in items): raise ValueError("出库数量必须大于0")
     if any(i["price"] < 0 for i in items): raise ValueError("单价不得小于0")
     _validate_active_products(items)
+    _validate_active_warehouse(warehouse)
     conn = get_conn()
     if outbound_type == "销售出库":
         customer = conn.execute(

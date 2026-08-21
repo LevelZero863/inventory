@@ -11,3 +11,4 @@ backups/*.db
 data/*.sqlite
 data/*.sqlite3
 backups/
+outputs/

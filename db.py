@@ -114,7 +114,10 @@ def init_db(seed: bool = True) -> None:
                 ("P001", "产品A", "规格A", "件", 10), ("P002", "产品B", "规格B", "件", 20), ("P003", "产品C", "规格C", "箱", 80)])
             conn.executemany("INSERT INTO customers(code,name,contact,settlement_method) VALUES (?,?,?,?)", [
                 ("C001", "客户A", "张三", "月结"), ("C002", "客户B", "李四", "现结")])
-            conn.executemany("INSERT INTO warehouses(name) VALUES (?)", [("一号仓",), ("二号仓",)])
+            conn.executemany(
+                "INSERT INTO warehouses(code,name) VALUES (?,?)",
+                [("WH001", "一号仓"), ("WH002", "二号仓")],
+            )
             conn.commit()
     finally:
         conn.close()
